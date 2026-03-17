@@ -104,10 +104,30 @@ uclchem_fortran_source = files(fsource_dir / 'constants.f90',
                      fsource_dir / 'wrap.f90'
                     )
 cvode_bridge_source = files(fsource_dir / 'cvode_bridge.c')
+f2py_fortran_source = files(fsource_dir / 'constants.f90',
+                     fsource_dir / 'defaultparameters.f90',
+                     fsource_dir / 'f2py_constants.f90',
+                     fsource_dir / 'physics-core.f90',
+                     fsource_dir / 'network.f90',
+                     fsource_dir / 'cloud.f90',
+                     fsource_dir / 'hotcore.f90',
+                     fsource_dir / 'postprocess.f90',
+                     fsource_dir / 'surfacereactions.f90',
+                     fsource_dir / 'sputtering.f90',
+                     fsource_dir / 'cshock.f90',
+                     fsource_dir / 'jshock.f90',
+                     fsource_dir / 'collapse.f90',
+                     fsource_dir / 'photoreactions.f90',
+                     fsource_dir / 'rates.f90',
+                     fsource_dir / 'odes.f90',
+                     fsource_dir / 'chemistry.f90',
+                     fsource_dir / 'io.f90',
+                     fsource_dir / 'wrap.f90'
+                    )
 
 # Custom target to generate the f2py wrappers 
 uclchem_wrapper = custom_target('uclchemwrapmodule.c',
-  input : uclchem_fortran_source,
+  input : f2py_fortran_source,
   output : ['uclchemwrapmodule.c', 'uclchemwrap-f2pywrappers2.f90'],
   command : [py, '-m', 'numpy.f2py', '@INPUT@', '-m', 'uclchemwrap', '--lower']
 )
