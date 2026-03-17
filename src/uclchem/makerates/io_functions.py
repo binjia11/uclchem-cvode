@@ -6,6 +6,7 @@ Functions to read in the species and reaction files and write output files
 import csv
 import fileinput
 import logging
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
@@ -262,6 +263,15 @@ def write_outputs(
         network.get_reaction_list(),
         rates_to_disk=rates_to_disk,
     )
+
+    jac_species = deepcopy(network.get_species_list())
+    jac_reactions = deepcopy(network.get_reaction_list())
+    jac_species_names = [spec.name for spec in jac_species]
+    for i, reaction in enumerate(jac_reactions):
+        reaction.generate_ode_bit(i, jac_species_names)
+    build_ode_string(jac_species, jac_reactions, rates_to_disk=rates_to_disk)
+    filename = fortran_src_dir / "jacobian.f90"
+    write_jacobian(filename, jac_species)
 
     # Write the network files
     filename = fortran_src_dir / "network.f90"
@@ -580,18 +590,26 @@ def build_ode_string(
             if species in species_names:
                 species_list[species_names.index(species)].gains += reaction.ode_bit
 
+    total_swap_expr = total_swap[1:] if total_swap else "0.0_dp"
+
     ode_string = """MODULE ODES
 USE constants
 USE network
 IMPLICIT NONE
 CONTAINS
+FUNCTION GETTOTALSWAP(RATE, Y, bulkLayersReciprocal) RESULT(totalSwap)
+REAL(dp), INTENT(IN) :: RATE(:), Y(:), bulkLayersReciprocal
+REAL(dp) :: totalSwap
+    """
+    ode_string += truncate_line(f"totalSwap={total_swap_expr}\n")
+    ode_string += """    END FUNCTION GETTOTALSWAP
 SUBROUTINE GETYDOT(RATE, Y, bulkLayersReciprocal, surfaceCoverage, safeMantle, safebulk, D, YDOT)
 REAL(dp), INTENT(IN) :: RATE(:), Y(:), bulkLayersReciprocal, safeMantle, safebulk, D
 REAL(dp), INTENT(INOUT) :: YDOT(:), surfaceCoverage
 REAL(dp) :: totalSwap, LOSS, PROD
     """
     # Add a logical to determine whether we can write the reaction rates in realtime
-    ode_string += truncate_line(f"totalSwap={total_swap[1:]}\n\n")
+    ode_string += "    totalSwap=GETTOTALSWAP(RATE, Y, bulkLayersReciprocal)\n\n"
     # First get total rate of change of bulk and surface by adding ydots
     for n, species in enumerate(species_list):
         if species.name[0] == "@":

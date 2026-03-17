@@ -18,6 +18,7 @@ USE network
 USE photoreactions
 USE surfacereactions
 use f2py_constants, only: nspec, nreac
+USE jacobian_sparse, only: jac_neq, jac_nnz, jac_col_ptr, jac_row_ind, fill_sparse_jacobian_values
 USE postprocess_mod, only: lusecoldens,usepostprocess,tstep,lnh,lnh2,lnco,lnc
 USE rates
 USE odes
@@ -41,7 +42,8 @@ IMPLICIT NONE
     REAL(dp) :: MIN_ABUND = 1.0d-30 !Minimum abundance allowed
 
     INTEGER :: nion,ionlist(nspec)
-    PRIVATE :: cvode_rhs_c
+    LOGICAL :: warnedChargeJacobian = .FALSE.
+    PRIVATE :: cvode_rhs_c, cvode_jac_c, update_state_dependent_rates
 
     ! CVODE return codes from cvode/cvode.h
     INTEGER, PARAMETER :: CV_SUCCESS=0, CV_TSTOP_RETURN=1
@@ -55,17 +57,27 @@ IMPLICIT NONE
     INTEGER, PARAMETER :: CV_NO_MALLOC=-23, CV_CONTEXT_ERR=-32
 
     INTERFACE
-        INTEGER(c_int) FUNCTION uclchem_cvode_integrate(neq, y, t, tout, reltol, abstol, mxstep, rhs) &
+        INTEGER(c_int) FUNCTION uclchem_cvode_init(neq, nnz, colptr, rowind, rhs, jac) &
+                & BIND(C, name="uclchem_cvode_init")
+            USE iso_c_binding, ONLY: c_int, c_funptr
+            INTEGER(c_int), VALUE :: neq, nnz
+            INTEGER(c_int), INTENT(IN) :: colptr(*), rowind(*)
+            TYPE(c_funptr), VALUE :: rhs, jac
+        END FUNCTION uclchem_cvode_init
+
+        INTEGER(c_int) FUNCTION uclchem_cvode_integrate(y, t, tout, reltol, abstol, mxstep) &
                 & BIND(C, name="uclchem_cvode_integrate")
             USE iso_c_binding, ONLY: c_int, c_long, c_double, c_funptr
-            INTEGER(c_int), VALUE :: neq
             REAL(c_double), INTENT(INOUT) :: y(*)
             REAL(c_double), INTENT(INOUT) :: t
             REAL(c_double), VALUE :: tout, reltol
             REAL(c_double), INTENT(IN) :: abstol(*)
             INTEGER(c_long), VALUE :: mxstep
-            TYPE(c_funptr), VALUE :: rhs
         END FUNCTION uclchem_cvode_integrate
+
+        INTEGER(c_int) FUNCTION uclchem_cvode_finalize() BIND(C, name="uclchem_cvode_finalize")
+            USE iso_c_binding, ONLY: c_int
+        END FUNCTION uclchem_cvode_finalize
     END INTERFACE
 CONTAINS
     SUBROUTINE initializeChemistry(readAbunds)
@@ -145,6 +157,19 @@ CONTAINS
            end if
         end do
         
+        IF (NEQ /= jac_neq) THEN
+            WRITE(*,*) "Analytic Jacobian size mismatch:", NEQ, jac_neq
+            STOP 1
+        END IF
+
+        ISTATE = INT(uclchem_cvode_finalize(), KIND(ISTATE))
+        ISTATE = INT(uclchem_cvode_init(INT(NEQ, c_int), INT(jac_nnz, c_int), jac_col_ptr, jac_row_ind, &
+     &      c_funloc(cvode_rhs_c), c_funloc(cvode_jac_c)), KIND(ISTATE))
+        IF (ISTATE /= CV_SUCCESS) THEN
+            WRITE(*,*) "Failed to initialize CVODE/KLU solver", ISTATE
+            STOP 1
+        END IF
+
         !ODE integrator settings
         ISTATE=1
 
@@ -270,8 +295,7 @@ CONTAINS
         abstol=abstol_factor*abund(:,dstep) !absolute tolerances depend on value of abundance
         WHERE(abstol<abstol_min) abstol=abstol_min ! to a minimum degree
         mxstep_cvode = INT(MXSTEP, c_long)
-        cvode_state = uclchem_cvode_integrate(NEQ, abund(:,dstep), currentTime, targetTime, reltol, abstol, &
-                & mxstep_cvode, c_funloc(cvode_rhs_c))
+        cvode_state = uclchem_cvode_integrate(abund(:,dstep), currentTime, targetTime, reltol, abstol, mxstep_cvode)
         ISTATE = INT(cvode_state, KIND(ISTATE))
 
         SELECT CASE(ISTATE)
@@ -326,6 +350,43 @@ CONTAINS
         cvode_rhs_c = 0_c_int
     END FUNCTION cvode_rhs_c
 
+    INTEGER(c_int) FUNCTION cvode_jac_c(t, y_ptr, fy_ptr, data_ptr, user_data) BIND(C)
+        REAL(c_double), VALUE :: t
+        TYPE(c_ptr), VALUE :: y_ptr, fy_ptr, data_ptr, user_data
+        REAL(c_double), POINTER :: y(:), fy(:), jac_data(:)
+        REAL(dp) :: D, safeBulkLocal, bulkLayersReciprocalLocal, totalSwapLocal
+
+        CALL c_f_pointer(y_ptr, y, [NEQ])
+        CALL c_f_pointer(fy_ptr, fy, [NEQ])
+        CALL c_f_pointer(data_ptr, jac_data, [jac_nnz])
+
+        D = y(NEQ)
+        CALL update_state_dependent_rates(y, D)
+        safeMantle = MAX(1d-30, y(nSurface))
+        safeBulkLocal = MAX(1d-30, y(nBulk))
+        bulkLayersReciprocalLocal = MIN(1.0_dp, NUM_SITES_PER_GRAIN / (GAS_DUST_DENSITY_RATIO * safeBulkLocal))
+        totalSwapLocal = GETTOTALSWAP(RATE, y, bulkLayersReciprocalLocal)
+        CALL fill_sparse_jacobian_values(RATE, y, safeMantle, D, bulkLayersReciprocalLocal, totalSwapLocal, jac_data)
+
+        IF (enforceChargeConservation .AND. .NOT. warnedChargeJacobian) THEN
+            WRITE(*,*) "WARNING: analytic sparse Jacobian does not yet adjust the electron row for enforceChargeConservation=.true."
+            warnedChargeJacobian = .TRUE.
+        END IF
+
+        cvode_jac_c = 0_c_int
+    END FUNCTION cvode_jac_c
+
+    SUBROUTINE update_state_dependent_rates(Y, D)
+        REAL(dp), INTENT(IN) :: Y(:), D
+
+        if (.not. lusecoldens) then
+            cocol=coColToCell+0.5*Y(nco)*D*(cloudSize/real(points))
+            h2col=h2ColToCell+0.5*Y(nh2)*D*(cloudSize/real(points))
+            rate(nR_H2_hv)=H2PhotoDissRate(h2Col,radField,av(dstep),turbVel)
+            rate(nR_CO_hv)=COPhotoDissRate(h2Col,coCol,radField,av(dstep))
+        end if
+    END SUBROUTINE update_state_dependent_rates
+
     SUBROUTINE F (NEQUATIONS, T, Y, YDOT)
         USE ODES
         INTEGER, PARAMETER :: WP = KIND(1.0D0)
@@ -343,15 +404,10 @@ CONTAINS
         ydot=0.0
 
         ! Column densities are fixed for postprocessing data, so don't do this bit
-        if (.not. lusecoldens) then
         !changing abundances of H2 and CO can causes oscillation since their rates depend on their abundances
         !recalculating rates as abundances are updated prevents that.
         !thus these are the only rates calculated each time the ODE system is called.
-        cocol=coColToCell+0.5*Y(nco)*D*(cloudSize/real(points))
-        h2col=h2ColToCell+0.5*Y(nh2)*D*(cloudSize/real(points))
-        rate(nR_H2_hv)=H2PhotoDissRate(h2Col,radField,av(dstep),turbVel) !H2 photodissociation
-        rate(nR_CO_hv)=COPhotoDissRate(h2Col,coCol,radField,av(dstep)) !CO photodissociation
-        end if
+        CALL update_state_dependent_rates(Y, D)
 
         !recalculate coefficients for ice processes
         safeMantle=MAX(1d-30,Y(nSurface))
@@ -385,19 +441,5 @@ CONTAINS
         ydot(NEQUATIONS)=densdot(y(NEQUATIONS))
     
     END SUBROUTINE F
-
-    ! SUBROUTINE JAC(NEQ, T, Y, ML, MU, J, NROWPD)
-    !     INTEGER NEQ,ML,MU,NROWPD
-    !     DOUBLE PRECISION T, Y(NEQ), J(NROWPD,NEQ)
-    !     REAL(DP) :: D
-    !     INTENT(IN)  :: NEQ, T, Y,ML,MU,NROWPD
-    !     INTENT(INOUT) :: J
-    !     D=y(NEQ)
-
-    !     J=0.0d0
-    !     INCLUDE 'jacobian.f90'
-    !     J(nh,nh2)=J(nh,nh2)+2.0*h2dis
-    !     J(nh2,nh2)=J(nh,nh2)-h2dis
-    ! END SUBROUTINE JAC
 
 END MODULE chemistry

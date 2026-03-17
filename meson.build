@@ -74,9 +74,13 @@ endif
 
 sundials_cvode_dep = cc.find_library('sundials_cvode', dirs: sundials_lib_dirs, required: true)
 sundials_nvecserial_dep = cc.find_library('sundials_nvecserial', dirs: sundials_lib_dirs, required: true)
-sundials_sunlinsoldense_dep = cc.find_library('sundials_sunlinsoldense', dirs: sundials_lib_dirs, required: true)
-sundials_sunmatrixdense_dep = cc.find_library('sundials_sunmatrixdense', dirs: sundials_lib_dirs, required: true)
+sundials_sunlinsolklu_dep = cc.find_library('sundials_sunlinsolklu', dirs: sundials_lib_dirs, required: true)
+sundials_sunmatrixsparse_dep = cc.find_library('sundials_sunmatrixsparse', dirs: sundials_lib_dirs, required: true)
 sundials_generic_dep = cc.find_library('sundials_generic', dirs: sundials_lib_dirs, required: true)
+klu_dep = cc.find_library('klu', dirs: sundials_lib_dirs, required: true)
+amd_dep = cc.find_library('amd', dirs: sundials_lib_dirs, required: true)
+colamd_dep = cc.find_library('colamd', dirs: sundials_lib_dirs, required: true)
+btf_dep = cc.find_library('btf', dirs: sundials_lib_dirs, required: true)
 
 uclchem_fortran_source = files(fsource_dir / 'constants.f90',
                      fsource_dir / 'defaultparameters.f90',
@@ -94,6 +98,7 @@ uclchem_fortran_source = files(fsource_dir / 'constants.f90',
                      fsource_dir / 'photoreactions.f90',
                      fsource_dir / 'rates.f90',
                      fsource_dir / 'odes.f90',
+                     fsource_dir / 'jacobian_sparse.f90',
                      fsource_dir / 'chemistry.f90',
                      fsource_dir / 'io.f90',
                      fsource_dir / 'wrap.f90'
@@ -120,9 +125,13 @@ py.extension_module('uclchemwrap',
                      quadmath_dep,
                      sundials_cvode_dep,
                      sundials_nvecserial_dep,
-                     sundials_sunlinsoldense_dep,
-                     sundials_sunmatrixdense_dep,
+                     sundials_sunlinsolklu_dep,
+                     sundials_sunmatrixsparse_dep,
                      sundials_generic_dep,
+                     klu_dep,
+                     amd_dep,
+                     colamd_dep,
+                     btf_dep,
                      ],
                      fortran_args: ['-O3', '-fPIC', '-ffree-line-length-0'],
                      install : true)

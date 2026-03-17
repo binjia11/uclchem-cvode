@@ -3,10 +3,9 @@ USE constants
 USE network
 IMPLICIT NONE
 CONTAINS
-SUBROUTINE GETYDOT(RATE, Y, bulkLayersReciprocal, surfaceCoverage, safeMantle, safebulk, D, YDOT)
-REAL(dp), INTENT(IN) :: RATE(:), Y(:), bulkLayersReciprocal, safeMantle, safebulk, D
-REAL(dp), INTENT(INOUT) :: YDOT(:), surfaceCoverage
-REAL(dp) :: totalSwap, LOSS, PROD
+FUNCTION GETTOTALSWAP(RATE, Y, bulkLayersReciprocal) RESULT(totalSwap)
+REAL(dp), INTENT(IN) :: RATE(:), Y(:), bulkLayersReciprocal
+REAL(dp) :: totalSwap
     totalSwap=RATE(1)*Y(253)*bulkLayersReciprocal+RATE(2)*Y(265)&
     &*bulkLayersReciprocal+RATE(3)*Y(267)*bulkLayersReciprocal+RATE(4)*Y(268)&
     &*bulkLayersReciprocal+RATE(5)*Y(272)*bulkLayersReciprocal+RATE(6)*Y(276)&
@@ -56,6 +55,12 @@ REAL(dp) :: totalSwap, LOSS, PROD
     &+RATE(79)*Y(290)*bulkLayersReciprocal+RATE(80)*Y(306)&
     &*bulkLayersReciprocal+RATE(81)*Y(325)*bulkLayersReciprocal+RATE(82)&
     &*Y(319)*bulkLayersReciprocal+RATE(83)*Y(329)*bulkLayersReciprocal
+    END FUNCTION GETTOTALSWAP
+SUBROUTINE GETYDOT(RATE, Y, bulkLayersReciprocal, surfaceCoverage, safeMantle, safebulk, D, YDOT)
+REAL(dp), INTENT(IN) :: RATE(:), Y(:), bulkLayersReciprocal, safeMantle, safebulk, D
+REAL(dp), INTENT(INOUT) :: YDOT(:), surfaceCoverage
+REAL(dp) :: totalSwap, LOSS, PROD
+        totalSwap=GETTOTALSWAP(RATE, Y, bulkLayersReciprocal)
 
     LOSS = RATE(117)*Y(1)+RATE(494)*D*Y(1)*Y(167)/safeMantle+RATE(545)*D&
     &*Y(1)+RATE(662)*D*Y(1)+RATE(662)*D*Y(1)+RATE(1778)*D*Y(96)*Y(1)&

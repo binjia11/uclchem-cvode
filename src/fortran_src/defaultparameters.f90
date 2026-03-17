@@ -102,7 +102,7 @@ REAL(dp) :: f18O=0.0 !Total initial abundance of 18O.
 REAL(dp) :: reltol=1d-8 !Relative tolerance for integration, see [integration docs](/docs/trouble-integration) for advice.
 REAL(dp) :: abstol_factor=1.0d-14 !Absolute tolerance for integration is calculated by multiplying species abundance by this factor.
 REAL(dp) :: abstol_min=1.0d-25 !Minimum value absolute tolerances can take.
-INTEGER :: MXSTEP=10000 !Maximum steps allowed in integration before warning is thrown. ! HAS TO BE INT4 instead of INT8
+INTEGER :: MXSTEP=100000 !Maximum steps allowed in integration before warning is thrown. ! HAS TO BE INT4 instead of INT8
 !
 !## Here be Dragons
 !*These are not recommended to be changed unless you know what you are doing*
