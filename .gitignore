@@ -21,3 +21,5 @@ dist
 .venv
 conda*
 .conda*
+.DS_Store
+analysis_outputs/

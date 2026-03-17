@@ -17,6 +17,7 @@ project('uclchemwrap',
 makerates_only = get_option('makerates_only')
 
 fc = meson.get_compiler('fortran')
+cc = meson.get_compiler('c')
 
 fsource_dir = meson.current_source_dir() / 'src' / 'fortran_src'
 
@@ -63,14 +64,21 @@ inc_np = include_directories(incdir_numpy, incdir_f2py)
 # gh-25000
 quadmath_dep = fc.find_library('quadmath', required: false)
 
-dvode_sources = files(fsource_dir / 'dvode.f90')
+conda_prefix = run_command(py, ['-c', 'import os; print(os.environ.get("CONDA_PREFIX", ""))'], check : true).stdout().strip()
+sundials_lib_dirs = []
+sundials_include_dirs = [inc_np]
+if conda_prefix != ''
+  sundials_lib_dirs = [conda_prefix / 'lib']
+  sundials_include_dirs += [include_directories(conda_prefix / 'include')]
+endif
 
-dvode_lib = static_library('dvode', dvode_sources,
-  # include_directories: inc_np,
-  dependencies: [quadmath_dep],
-)
+sundials_cvode_dep = cc.find_library('sundials_cvode', dirs: sundials_lib_dirs, required: true)
+sundials_nvecserial_dep = cc.find_library('sundials_nvecserial', dirs: sundials_lib_dirs, required: true)
+sundials_sunlinsoldense_dep = cc.find_library('sundials_sunlinsoldense', dirs: sundials_lib_dirs, required: true)
+sundials_sunmatrixdense_dep = cc.find_library('sundials_sunmatrixdense', dirs: sundials_lib_dirs, required: true)
+sundials_generic_dep = cc.find_library('sundials_generic', dirs: sundials_lib_dirs, required: true)
 
-uclchemwrap_source = files(fsource_dir / 'constants.f90',
+uclchem_fortran_source = files(fsource_dir / 'constants.f90',
                      fsource_dir / 'defaultparameters.f90',
                      fsource_dir / 'f2py_constants.f90',
                      fsource_dir / 'physics-core.f90',
@@ -90,28 +98,32 @@ uclchemwrap_source = files(fsource_dir / 'constants.f90',
                      fsource_dir / 'io.f90',
                      fsource_dir / 'wrap.f90'
                     )
+cvode_bridge_source = files(fsource_dir / 'cvode_bridge.c')
 
 # Custom target to generate the f2py wrappers 
 uclchem_wrapper = custom_target('uclchemwrapmodule.c',
-  input : uclchemwrap_source,  
+  input : uclchem_fortran_source,
   output : ['uclchemwrapmodule.c', 'uclchemwrap-f2pywrappers2.f90'],
   command : [py, '-m', 'numpy.f2py', '@INPUT@', '-m', 'uclchemwrap', '--lower']
 )
 
 py.extension_module('uclchemwrap',
                      [
-                      uclchemwrap_source,
+                      uclchem_fortran_source,
+                      cvode_bridge_source,
                       uclchem_wrapper,
                       fortranobject_c
                      ],
-                     include_directories: [
-                     inc_np,
-                     ],
+                     include_directories: sundials_include_dirs,
                      dependencies : [
                      py_dep,
                      quadmath_dep,
+                     sundials_cvode_dep,
+                     sundials_nvecserial_dep,
+                     sundials_sunlinsoldense_dep,
+                     sundials_sunmatrixdense_dep,
+                     sundials_generic_dep,
                      ],
-                     link_with : dvode_lib,
                      fortran_args: ['-O3', '-fPIC', '-ffree-line-length-0'],
                      install : true)
 

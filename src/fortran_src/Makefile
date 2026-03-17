@@ -5,6 +5,7 @@ SHELL = /bin/sh
 ################################################################################
 FC =gfortran
 #FC=ifort
+CC = cc
 
 f2pyFC=gnu95 #this must match FC (ifort=intelem, gfortran=gnu95)
 
@@ -12,6 +13,16 @@ f2pyFC=gnu95 #this must match FC (ifort=intelem, gfortran=gnu95)
 #FFLAGS =-g -fbacktrace -Wall -fcheck=all -fPIC
 #Fast optimizing flags
 FFLAGS = -O3 -fPIC -ffree-line-length-0
+CFLAGS = -O3 -fPIC
+
+SUNDIALS_PREFIX ?= $(CONDA_PREFIX)
+SUNDIALS_CFLAGS =
+SUNDIALS_LDFLAGS =
+ifneq ($(strip $(SUNDIALS_PREFIX)),)
+SUNDIALS_CFLAGS += -I$(SUNDIALS_PREFIX)/include
+SUNDIALS_LDFLAGS += -L$(SUNDIALS_PREFIX)/lib
+endif
+SUNDIALS_LIBS = -lsundials_cvode -lsundials_nvecserial -lsundials_sunlinsoldense -lsundials_sunmatrixdense -lsundials_generic
 
 
 ###############################################################################
@@ -21,6 +32,7 @@ EXT_SUFFIX = $(shell python3-config --extension-suffix)
 PHYSICS_OBS= physics-core.o cloud.o hotcore.o sputtering.o cshock.o jshock.o collapse.o postprocess.o
 CHEMISTRY_OBS = odes.o photoreactions.o surfacereactions.o rates.o chemistry.o
 CONSTANTS_OBS = constants.o defaultparameters.o f2py_constants.o
+CVODE_OBS = cvode_bridge.o
 
 ##simple makefile for uclchem
 ##user must point the FC variable to their preferred fortran compiler
@@ -31,13 +43,13 @@ CONSTANTS_OBS = constants.o defaultparameters.o f2py_constants.o
 ##and edit the python makef
 
 ##physics module selected by changing physics variable to chosen fortran file.
-main: dvode.o ${CONSTANTS_OBS} network.o ${PHYSICS_OBS}  ${CHEMISTRY_OBS} io.o wrap.f90 
-	${FC} ${FFLAGS} -o ../../uclchem ${CONSTANTS_OBS} io.o ${PHYSICS_OBS} dvode.o ${CHEMISTRY_OBS} network.o wrap.f90 main.f90
+main: ${CVODE_OBS} ${CONSTANTS_OBS} network.o ${PHYSICS_OBS}  ${CHEMISTRY_OBS} io.o wrap.f90
+	${FC} ${FFLAGS} ${SUNDIALS_LDFLAGS} -o ../../uclchem ${CONSTANTS_OBS} io.o ${PHYSICS_OBS} ${CVODE_OBS} ${CHEMISTRY_OBS} network.o wrap.f90 main.f90 ${SUNDIALS_LIBS}
 
 # The order here is the compilation order and it's vital that modules are compiled after their dependencies
 # We need to pass f2py_constants.f90 into wrap.f90 in order for nspec (and other parameters) to be in scope in wrap.
-python: ${CONTANTS_OBS} network.o ${PHYSICS_OBS} dvode.o ${CHEMISTRY_OBS} io.o  wrap.f90
-	python3 -m numpy.f2py -c --fcompiler=${f2pyFC} ${CONSTANTS_OBS} network.o io.o ${PHYSICS_OBS} dvode.o ${CHEMISTRY_OBS} f2py_constants.f90 wrap.f90 -m uclchemwrap
+python: ${CONSTANTS_OBS} network.o ${PHYSICS_OBS} ${CVODE_OBS} ${CHEMISTRY_OBS} io.o wrap.f90
+	python3 -m numpy.f2py -c --fcompiler=${f2pyFC} ${SUNDIALS_CFLAGS} ${SUNDIALS_LDFLAGS} ${CONSTANTS_OBS} network.o io.o ${PHYSICS_OBS} ${CVODE_OBS} ${CHEMISTRY_OBS} f2py_constants.f90 wrap.f90 ${SUNDIALS_LIBS} -m uclchemwrap
 # Optional useful flags for debugging: --debug-capi, --debug, --f90flags="-fcheck=all"
 
 chemistry.o: photoreactions.f90 surfacereactions.f90 rates.f90 odes.f90  chemistry.f90
@@ -48,6 +60,9 @@ sputtering.o: surfacereactions.o sputtering.f90
 
 %.o: %.f90 
 	${FC} ${FFLAGS} -c $<
+
+%.o: %.c
+	${CC} ${CFLAGS} ${SUNDIALS_CFLAGS} -c $<
 
 # This can de disabled for fast development, but it will cause major issues when you change chemical networks.
 clean: 

@@ -10,10 +10,10 @@
 MODULE chemistry
 USE constants
 USE DEFAULTPARAMETERS
+USE iso_c_binding, ONLY: c_int, c_long, c_double, c_ptr, c_funptr, c_funloc, c_f_pointer
 !f2py INTEGER, parameter :: dp
 USE physicscore, only: points, dstep, cloudsize, radfield, h2crprate, improvedH2CRPDissociation, &
 & zeta, currentTime, targetTime, timeinyears, freefall, density, ion, densdot, gastemp, dusttemp, av
-USE DVODE_F90_M !dvode_f90_m
 USE network
 USE photoreactions
 USE surfacereactions
@@ -31,10 +31,9 @@ IMPLICIT NONE
     !Array to store reaction rates
     REAL(dp) :: rate(nreac)
     
-    !DLSODE variables    
-    INTEGER :: ITASK,ISTATE,NEQ
+    !ODE integrator state
+    INTEGER :: ISTATE,NEQ
     REAL(dp), ALLOCATABLE :: abstol(:)
-    ! TYPE(VODE_OPTS) :: OPTIONS
     !initial fractional elemental abudances and arrays to store abundances
     REAL(dp) :: h2col,cocol,ccol,h2colToCell,cocolToCell,ccolToCell
     REAL(dp), ALLOCATABLE :: abund(:,:)
@@ -42,6 +41,32 @@ IMPLICIT NONE
     REAL(dp) :: MIN_ABUND = 1.0d-30 !Minimum abundance allowed
 
     INTEGER :: nion,ionlist(nspec)
+    PRIVATE :: cvode_rhs_c
+
+    ! CVODE return codes from cvode/cvode.h
+    INTEGER, PARAMETER :: CV_SUCCESS=0, CV_TSTOP_RETURN=1
+    INTEGER, PARAMETER :: CV_TOO_MUCH_WORK=-1, CV_TOO_MUCH_ACC=-2
+    INTEGER, PARAMETER :: CV_ERR_FAILURE=-3, CV_CONV_FAILURE=-4
+    INTEGER, PARAMETER :: CV_LINIT_FAIL=-5, CV_LSETUP_FAIL=-6, CV_LSOLVE_FAIL=-7
+    INTEGER, PARAMETER :: CV_RHSFUNC_FAIL=-8, CV_FIRST_RHSFUNC_ERR=-9
+    INTEGER, PARAMETER :: CV_REPTD_RHSFUNC_ERR=-10, CV_UNREC_RHSFUNC_ERR=-11
+    INTEGER, PARAMETER :: CV_NLS_INIT_FAIL=-13, CV_NLS_SETUP_FAIL=-14, CV_NLS_FAIL=-16
+    INTEGER, PARAMETER :: CV_MEM_FAIL=-20, CV_MEM_NULL=-21, CV_ILL_INPUT=-22
+    INTEGER, PARAMETER :: CV_NO_MALLOC=-23, CV_CONTEXT_ERR=-32
+
+    INTERFACE
+        INTEGER(c_int) FUNCTION uclchem_cvode_integrate(neq, y, t, tout, reltol, abstol, mxstep, rhs) &
+                & BIND(C, name="uclchem_cvode_integrate")
+            USE iso_c_binding, ONLY: c_int, c_long, c_double, c_funptr
+            INTEGER(c_int), VALUE :: neq
+            REAL(c_double), INTENT(INOUT) :: y(*)
+            REAL(c_double), INTENT(INOUT) :: t
+            REAL(c_double), VALUE :: tout, reltol
+            REAL(c_double), INTENT(IN) :: abstol(*)
+            INTEGER(c_long), VALUE :: mxstep
+            TYPE(c_funptr), VALUE :: rhs
+        END FUNCTION uclchem_cvode_integrate
+    END INTERFACE
 CONTAINS
     SUBROUTINE initializeChemistry(readAbunds)
         LOGICAL, INTENT(IN) :: readAbunds
@@ -120,9 +145,8 @@ CONTAINS
            end if
         end do
         
-        !DVODE SETTINGS
+        !ODE integrator settings
         ISTATE=1
-        ITASK=1
 
         !set integration counts
         loopCounter=0
@@ -131,8 +155,6 @@ CONTAINS
         IF (.NOT. ALLOCATED(abstol)) THEN
             ALLOCATE(abstol(NEQ))
         END IF
-        !OPTIONS = SET_OPTS(METHOD_FLAG=22, ABSERR_VECTOR=abstol, RELERR=reltol,USER_SUPPLIED_JACOBIAN=.FALSE.)
-        
         !Set rates to zero to ensure they don't hold previous values or random ones if we don't set them in calculateReactionRates
         rate=0.0
         !We typically don't recalculate rates that only depend on temperature if the temp hasn't changed
@@ -240,56 +262,69 @@ CONTAINS
 
     SUBROUTINE integrateODESystem(successFlag)
         INTEGER, INTENT(OUT) :: successFlag
-        TYPE(VODE_OPTS) :: OPTIONS
+        INTEGER(c_int) :: cvode_state
+        INTEGER(c_long) :: mxstep_cvode
         successFlag=0
 
-    !This subroutine calls DVODE (3rd party ODE solver) until it can reach targetTime with acceptable errors (reltol/abstol)
-        !reset parameters for DVODE
-        ITASK=1 !try to integrate to targetTime
-        ISTATE=1 !pretend every step is the first
+    !This subroutine calls CVODE until it can reach targetTime with acceptable errors (reltol/abstol)
         abstol=abstol_factor*abund(:,dstep) !absolute tolerances depend on value of abundance
         WHERE(abstol<abstol_min) abstol=abstol_min ! to a minimum degree
-        !Call the integrator.
-        OPTIONS = SET_OPTS(METHOD_FLAG=22, ABSERR_VECTOR=abstol, RELERR=reltol,USER_SUPPLIED_JACOBIAN=.False.,MXSTEP=MXSTEP)
-        CALL DVODE_F90(F,NEQ,abund(:,dstep),currentTime,targetTime,ITASK,ISTATE,OPTIONS)
+        mxstep_cvode = INT(MXSTEP, c_long)
+        cvode_state = uclchem_cvode_integrate(NEQ, abund(:,dstep), currentTime, targetTime, reltol, abstol, &
+                & mxstep_cvode, c_funloc(cvode_rhs_c))
+        ISTATE = INT(cvode_state, KIND(ISTATE))
 
         SELECT CASE(ISTATE)
-            CASE(-1)
-                !ISTATE -1 means the integrator can't break the problem into small enough steps
-                !We could increase MXSTEP but better to reduce targetTime and get to physics update
-                !physical conditions may be easier to solve as time goes by so better to get to that update
+            CASE(CV_TOO_MUCH_WORK)
+                ! CVODE couldn't take enough steps before reaching targetTime
                 write(*,*) "ISTATE -1: Reducing time step to ", (targetTime-currentTime)*0.1/SECONDS_PER_YEAR, "years"
-                !More steps required for this problem
-                !MXSTEP=MXSTEP*2   
                 targetTime=currentTime+(targetTime-currentTime)*0.1
-            CASE(-2)
-                !ISTATE -2 just needs an absol change so let's do that and try again
+            CASE(CV_TOO_MUCH_ACC)
+                ! Tolerances are too small for machine precision
                 write(*,*) "ISTATE -2: Tolerances too small"
-                !Tolerances are too small for machine but succesful to current currentTime
                 abstol_factor=abstol_factor*10.0
-            CASE(-3)
-                !ISTATE -3 is unrecoverable so just bail on intergration
-                write(*,*) "DVODE found invalid inputs"
+            CASE(CV_MEM_FAIL, CV_MEM_NULL, CV_ILL_INPUT, CV_NO_MALLOC, CV_CONTEXT_ERR)
+                write(*,*) "CVODE found invalid inputs"
                 write(*,*) "abstol:"
                 write(*,*) abstol
                 successFlag=INT_UNRECOVERABLE_ERROR
                 RETURN
-            CASE(-4)
-                !Successful as far as currentTime but many errors.
-                !Make targetTime smaller and just go again
+            CASE(CV_ERR_FAILURE, CV_CONV_FAILURE, CV_LINIT_FAIL, CV_LSETUP_FAIL, CV_LSOLVE_FAIL, &
+                    & CV_NLS_INIT_FAIL, CV_NLS_SETUP_FAIL, CV_NLS_FAIL)
                 write(*,*) "ISTATE -4 - shortening step"
                 targetTime=currentTime+(targetTime-currentTime)*0.1
-            CASE(-5)
-                write(*,*) "ISTATE -5 - shortening step at time", timeInYears,"years"
-                targetTime=currentTime+(targetTime-currentTime)*0.1
-            CASE default
+            CASE(CV_RHSFUNC_FAIL, CV_FIRST_RHSFUNC_ERR, CV_REPTD_RHSFUNC_ERR, CV_UNREC_RHSFUNC_ERR)
+                write(*,*) "CVODE RHS failure at time", timeInYears,"years"
+                successFlag=INT_UNRECOVERABLE_ERROR
+                RETURN
+            CASE(CV_SUCCESS, CV_TSTOP_RETURN)
                 MXSTEP=10000
+            CASE default
+                IF (ISTATE .lt. 0) THEN
+                    write(*,*) "CVODE returned error code", ISTATE
+                    targetTime=currentTime+(targetTime-currentTime)*0.1
+                ELSE
+                    MXSTEP=10000
+                END IF
         END SELECT
     if (enforceChargeConservation) then
         ! REALLY ensure charge is always conserved (also after integrating)
         abund(nelec,dstep) = sum(abund(ionlist(1:nion),dstep))
     end if
     END SUBROUTINE integrateODESystem
+
+    INTEGER(c_int) FUNCTION cvode_rhs_c(t, y_ptr, ydot_ptr, user_data) BIND(C)
+        REAL(c_double), VALUE :: t
+        TYPE(c_ptr), VALUE :: y_ptr, ydot_ptr, user_data
+        REAL(c_double), POINTER :: y(:), ydot(:)
+        REAL(dp) :: t_local
+
+        CALL c_f_pointer(y_ptr, y, [NEQ])
+        CALL c_f_pointer(ydot_ptr, ydot, [NEQ])
+        t_local = REAL(t, dp)
+        CALL F(NEQ, t_local, y, ydot)
+        cvode_rhs_c = 0_c_int
+    END FUNCTION cvode_rhs_c
 
     SUBROUTINE F (NEQUATIONS, T, Y, YDOT)
         USE ODES
