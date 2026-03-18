@@ -15,7 +15,6 @@ f2pyFC=gnu95 #this must match FC (ifort=intelem, gfortran=gnu95)
 FFLAGS = -O3 -fPIC -ffree-line-length-0
 CFLAGS = -O3 -fPIC
 JACOBIAN_FFLAGS = -O0 -fPIC -ffree-line-length-0
-
 SUNDIALS_PREFIX ?= $(CONDA_PREFIX)
 SUNDIALS_CFLAGS =
 SUNDIALS_LDFLAGS =
@@ -31,7 +30,7 @@ EXT_SUFFIX = $(shell python3-config --extension-suffix)
 
 
 PHYSICS_OBS= physics-core.o cloud.o hotcore.o sputtering.o cshock.o jshock.o collapse.o postprocess.o
-CHEMISTRY_OBS = odes.o photoreactions.o surfacereactions.o rates.o jacobian_sparse.o chemistry.o
+CHEMISTRY_OBS = odes.o photoreactions.o surfacereactions.o rates.o jacobian.o chemistry.o
 CONSTANTS_OBS = constants.o defaultparameters.o f2py_constants.o
 CVODE_OBS = cvode_bridge.o
 
@@ -53,11 +52,11 @@ python: ${CONSTANTS_OBS} network.o ${PHYSICS_OBS} ${CVODE_OBS} ${CHEMISTRY_OBS} 
 	python3 -m numpy.f2py -c --fcompiler=${f2pyFC} ${SUNDIALS_CFLAGS} ${SUNDIALS_LDFLAGS} ${CONSTANTS_OBS} network.o io.o ${PHYSICS_OBS} ${CVODE_OBS} ${CHEMISTRY_OBS} f2py_constants.f90 wrap.f90 ${SUNDIALS_LIBS} -m uclchemwrap
 # Optional useful flags for debugging: --debug-capi, --debug, --f90flags="-fcheck=all"
 
-chemistry.o: photoreactions.f90 surfacereactions.f90 rates.f90 odes.f90 jacobian_sparse.f90 chemistry.f90
+chemistry.o: photoreactions.f90 surfacereactions.f90 rates.f90 odes.f90 jacobian.f90 chemistry.f90
 	${FC} ${FFLAGS} -c chemistry.f90
 
-jacobian_sparse.o: physics-core.f90 jacobian_sparse.f90
-	${FC} ${JACOBIAN_FFLAGS} -c jacobian_sparse.f90
+jacobian.o: jacobian.f90
+	${FC} ${JACOBIAN_FFLAGS} -c jacobian.f90
 
 sputtering.o: surfacereactions.o sputtering.f90
 	${FC} ${FFLAGS} -c sputtering.f90

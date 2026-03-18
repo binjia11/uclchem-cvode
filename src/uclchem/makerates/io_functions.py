@@ -471,73 +471,181 @@ def write_odes_f90(
         output.write(ydotString)
 
 
-def write_jacobian(file_name: Path, species_list: list[Species]) -> None:
-    """Write jacobian in Modern Fortran. This has never improved UCLCHEM's speed
-    and so is not used in the code as it stands.
-    Current only works for three phase model.
+def _build_jacobian_entries(
+    species_list: list[Species],
+) -> tuple[list[tuple[int, int, str]], list[int], list[int]]:
+    """Build dense Jacobian assignments and the species lists used by aggregate rows."""
 
-    Args:
-        file_name (str): Path to jacobian file
-        species_list (species_list): List of species AFTER being processed by build_ode_string
-    """
-    output = open(file_name, "w")
+    entries: list[tuple[int, int, str]] = []
+    surface_rows = [idx + 1 for idx, species in enumerate(species_list) if species.name.startswith("#")]
+    bulk_rows = [idx + 1 for idx, species in enumerate(species_list) if species.name.startswith("@")]
     species_names = ""
+
     for i, species in enumerate(species_list):
         species_names += species.name
         losses = species.losses.split("+")
         gains = species.gains.split("+")
+
         for j in range(1, len(species_list) + 1):
             if species.name == "SURFACE":
-                di_dj = f"J({i + 1},{j})=SUM(J(surfaceList,{j}))\n"
-                output.write(di_dj)
+                entries.append((i + 1, j, f"SUM(J(surfaceList,{j}))"))
             elif species.name == "BULK":
                 if species_names.count("@") > 0:
-                    di_dj = f"J({i + 1},{j})=SUM(J(bulkList,{j}))\n"
-                    output.write(di_dj)
+                    entries.append((i + 1, j, f"SUM(J(bulkList,{j}))"))
             else:
-                # every time an ode bit has our species in it, we remove it (dy/dx=a for y=ax)
                 di_dj = [
                     f"-{x}".replace(f"*Y({j})", "", 1)
                     for x in losses
                     if f"*Y({j})" in x
                 ]
                 di_dj += [
-                    f"+{x}".replace(f"*Y({j})", "", 1) for x in gains if f"*Y({j})" in x
+                    f"+{x}".replace(f"*Y({j})", "", 1)
+                    for x in gains
+                    if f"*Y({j})" in x
                 ]
-                # of course there might be y=a*x*x so we only replace first instance and if there's still an instance
-                # we put a factor of two in since dy/dx=2ax for y=a*x*x
                 di_dj = [x + "*2" if f"*Y({j})" in x else x for x in di_dj]
 
-                # safeMantle is a stand in for the surface so do it manually here
-                # since it's divided by safemantle, derivative is negative so sign flips and we get another factor of 1/safeMantle
                 if species_list[j - 1].name == "SURFACE":
                     di_dj = [f"+{x}/safeMantle" for x in losses if "/safeMantle" in x]
                     di_dj += [f"-{x}/safeMantle" for x in gains if "/safeMantle" in x]
-                if len(di_dj) > 0:
-                    di_dj = f"J({i + 1},{j})=" + "".join(di_dj) + "\n"
-                    output.write(di_dj)
 
-        # tackle density separately.handled
-        j = j + 1
+                if di_dj:
+                    entries.append((i + 1, j, "".join(di_dj)))
+
+        density_col = len(species_list) + 1
         if species.name == "SURFACE":
-            di_dj = f"J({i + 1},{j})=SUM(J(surfaceList,{j}))\n"
-            output.write(di_dj)
+            entries.append((i + 1, density_col, f"SUM(J(surfaceList,{density_col}))"))
         elif species.name == "BULK":
             if species_names.count("@") > 0:
-                di_dj = f"J({i + 1},{j})=SUM(J(bulkList,{j}))\n"
-                output.write(di_dj)
+                entries.append((i + 1, density_col, f"SUM(J(bulkList,{density_col}))"))
         else:
             di_dj = [f"-{x}".replace("*D", "", 1) for x in losses if "*D" in x]
             di_dj += [f"+{x}".replace("*D", "", 1) for x in gains if "*D" in x]
             di_dj = [x + "*2" if "*D" in x else x for x in di_dj]
-            if len(di_dj) > 0:
-                di_dj = f"J({i + 1},{j})=" + ("".join(di_dj)) + "\n"
-                output.write(di_dj)
-    i = i + 2
-    di_dj = f"J({i},{i})=ddensdensdot(D)\n"
-    output.write(di_dj)
+            if di_dj:
+                entries.append((i + 1, density_col, "".join(di_dj)))
 
-    output.close()
+    entries.append((len(species_list) + 1, len(species_list) + 1, "ddensdensdot(D)"))
+    return entries, surface_rows, bulk_rows
+
+
+def _sparse_jacobian_structure(
+    entries: list[tuple[int, int, str]], neq: int, surface_rows: list[int], bulk_rows: list[int]
+) -> tuple[list[int], list[int], list[tuple[int, int, str]], dict[int, list[int]]]:
+    """Return CSC structure and aggregate dependencies derived from dense entries."""
+
+    entries_by_col: dict[int, list[tuple[int, str]]] = {col: [] for col in range(1, neq + 1)}
+    for row, col, expr in entries:
+        entries_by_col.setdefault(col, []).append((row, expr))
+
+    for col in entries_by_col:
+        entries_by_col[col].sort(key=lambda item: item[0])
+
+    col_ptr = [0]
+    row_ind: list[int] = []
+    ordered_entries: list[tuple[int, int, str]] = []
+    entry_index: dict[tuple[int, int], int] = {}
+    aggregate_dependencies: dict[int, list[int]] = {}
+
+    for col in range(1, neq + 1):
+        for row, expr in entries_by_col.get(col, []):
+            row_ind.append(row - 1)
+            ordered_entries.append((row, col, expr))
+            entry_index[(row, col)] = len(ordered_entries)
+        col_ptr.append(len(row_ind))
+
+    aggregate_lists = {
+        "SUM(J(surfaceList,{col}))": surface_rows,
+        "SUM(J(bulkList,{col}))": bulk_rows,
+    }
+
+    for sparse_index, (row, col, expr) in enumerate(ordered_entries, start=1):
+        for template, source_rows in aggregate_lists.items():
+            if expr == template.format(col=col):
+                aggregate_dependencies[sparse_index] = [
+                    entry_index[(source_row, col)]
+                    for source_row in source_rows
+                    if (source_row, col) in entry_index
+                ]
+                break
+
+    return col_ptr, row_ind, ordered_entries, aggregate_dependencies
+
+
+def _write_integer_parameter_array(name: str, values: list[int]) -> str:
+    values_str = ",".join(str(value) for value in values)
+    return truncate_line(
+        f"INTEGER, PARAMETER :: {name}({len(values)}) = (/ {values_str} /)\n"
+    )
+
+
+def write_jacobian(file_name: Path, species_list: list[Species]) -> None:
+    """Write a compilable dense+sparse Jacobian module in Modern Fortran.
+
+    Args:
+        file_name (str): Path to jacobian file
+        species_list (species_list): List of species AFTER being processed by build_ode_string
+    """
+    neq = len(species_list) + 1
+    entries, surface_rows, bulk_rows = _build_jacobian_entries(species_list)
+    col_ptr, row_ind, ordered_entries, aggregate_dependencies = _sparse_jacobian_structure(
+        entries, neq, surface_rows, bulk_rows
+    )
+
+    with open(file_name, "w") as output:
+        output.write("MODULE jacobian\n")
+        output.write("USE constants\n")
+        output.write("USE iso_c_binding, ONLY: c_int\n")
+        output.write("USE network\n")
+        output.write("USE physicscore, ONLY: densdot\n")
+        output.write("IMPLICIT NONE\n")
+        output.write(f"INTEGER, PARAMETER :: jac_neq = {neq}\n")
+        output.write(f"INTEGER, PARAMETER :: jac_nnz = {len(ordered_entries)}\n")
+        output.write(_write_integer_parameter_array("jac_col_ptr", col_ptr))
+        output.write(_write_integer_parameter_array("jac_row_ind", row_ind))
+        output.write("CONTAINS\n")
+        output.write(
+            'INTEGER(c_int) FUNCTION uclchem_sparse_jacobian_nnz() BIND(C, name="uclchem_sparse_jacobian_nnz")\n'
+        )
+        output.write("    uclchem_sparse_jacobian_nnz = INT(jac_nnz, c_int)\n")
+        output.write("END FUNCTION uclchem_sparse_jacobian_nnz\n")
+        output.write(
+            'SUBROUTINE uclchem_sparse_jacobian_pattern(colptr, rowind) BIND(C, name="uclchem_sparse_jacobian_pattern")\n'
+        )
+        output.write("    INTEGER(c_int), INTENT(OUT) :: colptr(*), rowind(*)\n")
+        output.write("    INTEGER :: i\n")
+        output.write("    DO i = 1, jac_neq + 1\n")
+        output.write("        colptr(i) = INT(jac_col_ptr(i), c_int)\n")
+        output.write("    END DO\n")
+        output.write("    DO i = 1, jac_nnz\n")
+        output.write("        rowind(i) = INT(jac_row_ind(i), c_int)\n")
+        output.write("    END DO\n")
+        output.write("END SUBROUTINE uclchem_sparse_jacobian_pattern\n")
+        output.write(
+            "SUBROUTINE GETJACOBIAN_SPARSE_VALUES(RATE, Y, safeMantle, D, bulkLayersReciprocal, totalSwap, JDATA)\n"
+        )
+        output.write(
+            "REAL(dp), INTENT(IN) :: RATE(:), Y(:), safeMantle, D, bulkLayersReciprocal, totalSwap\n"
+        )
+        output.write("REAL(dp), INTENT(OUT) :: JDATA(:)\n")
+        for idx, (_, col, expr) in enumerate(ordered_entries, start=1):
+            if idx in aggregate_dependencies:
+                dependencies = aggregate_dependencies[idx]
+                if dependencies:
+                    expr = "+".join(f"JDATA({dep})" for dep in dependencies)
+                else:
+                    expr = "0.0_dp"
+            output.write(truncate_line(f"    JDATA({idx})={expr}\n"))
+        output.write("END SUBROUTINE GETJACOBIAN_SPARSE_VALUES\n")
+        output.write("REAL(dp) FUNCTION ddensdensdot(D)\n")
+        output.write("    REAL(dp), INTENT(IN) :: D\n")
+        output.write("    REAL(dp) :: safeD\n")
+        output.write("    safeD = MAX(D, 1.0d-30)\n")
+        output.write(
+            "    ddensdensdot = (densdot(1.0001d0*safeD)-densdot(safeD))/(0.0001d0*safeD)\n"
+        )
+        output.write("END FUNCTION ddensdensdot\n")
+        output.write("END MODULE jacobian\n")
 
 
 def build_ode_string(

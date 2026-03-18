@@ -8,12 +8,12 @@
 #include <string.h>
 
 typedef int (*uclchem_rhs_fn)(double t, const double *y, double *ydot, void *user_data);
-typedef int (*uclchem_jac_fn)(double t, const double *y, const double *fy, double *jac_data,
-                              void *user_data);
+extern int uclchem_sparse_jacobian_nnz(void);
+extern void uclchem_sparse_jacobian_pattern(int *colptr, int *rowind);
+extern int uclchem_cvode_sparse_jacobian(double t, void *y_ptr, void *data_ptr);
 
 struct uclchem_callback_data {
   uclchem_rhs_fn rhs;
-  uclchem_jac_fn jac;
   void *user_data;
 };
 
@@ -46,20 +46,20 @@ static int rhs_bridge(realtype t, N_Vector y, N_Vector ydot, void *user_data) {
 
 static int jac_bridge(realtype t, N_Vector y, N_Vector fy, SUNMatrix J, void *user_data,
                       N_Vector tmp1, N_Vector tmp2, N_Vector tmp3) {
-  struct uclchem_callback_data *data = (struct uclchem_callback_data *)user_data;
   double *y_ptr = N_VGetArrayPointer_Serial(y);
-  double *fy_ptr = N_VGetArrayPointer_Serial(fy);
-  double *jac_data = SUNSparseMatrix_Data(J);
+  realtype *jac_data = SM_DATA_S(J);
 
+  (void)fy;
+  (void)user_data;
   (void)tmp1;
   (void)tmp2;
   (void)tmp3;
 
-  if (data == NULL || data->jac == NULL || y_ptr == NULL || fy_ptr == NULL || jac_data == NULL) {
+  if (y_ptr == NULL || jac_data == NULL) {
     return CVLS_JACFUNC_UNRECVR;
   }
 
-  return data->jac((double)t, y_ptr, fy_ptr, jac_data, data->user_data);
+  return uclchem_cvode_sparse_jacobian((double)t, (void *)y_ptr, (void *)jac_data);
 }
 
 static void uclchem_cvode_free_solver(void) {
@@ -84,14 +84,13 @@ static void uclchem_cvode_free_solver(void) {
   memset(&solver, 0, sizeof(solver));
 }
 
-int uclchem_cvode_init(int neq, int nnz, const int *colptr, const int *rowind, uclchem_rhs_fn rhs,
-                       uclchem_jac_fn jac) {
+int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
   int retval;
-  sunindextype i;
   sunindextype *index_ptrs;
   sunindextype *index_vals;
+  int nnz;
 
-  if (neq <= 0 || nnz <= 0 || colptr == NULL || rowind == NULL || rhs == NULL || jac == NULL) {
+  if (neq <= 0 || rhs == NULL) {
     return CV_ILL_INPUT;
   }
 
@@ -103,6 +102,11 @@ int uclchem_cvode_init(int neq, int nnz, const int *colptr, const int *rowind, u
   }
 
   solver.neq = (sunindextype)neq;
+  nnz = uclchem_sparse_jacobian_nnz();
+  if (nnz <= 0) {
+    uclchem_cvode_free_solver();
+    return CV_ILL_INPUT;
+  }
   solver.nnz = (sunindextype)nnz;
 
   solver.yvec = N_VNew_Serial(solver.neq, solver.sunctx);
@@ -118,19 +122,13 @@ int uclchem_cvode_init(int neq, int nnz, const int *colptr, const int *rowind, u
     return CV_MEM_FAIL;
   }
 
-  index_ptrs = SUNSparseMatrix_IndexPointers(solver.A);
-  index_vals = SUNSparseMatrix_IndexValues(solver.A);
+  index_ptrs = SM_INDEXPTRS_S(solver.A);
+  index_vals = SM_INDEXVALS_S(solver.A);
   if (index_ptrs == NULL || index_vals == NULL) {
     uclchem_cvode_free_solver();
     return CV_MEM_FAIL;
   }
-
-  for (i = 0; i < solver.neq + 1; ++i) {
-    index_ptrs[i] = (sunindextype)colptr[i];
-  }
-  for (i = 0; i < solver.nnz; ++i) {
-    index_vals[i] = (sunindextype)rowind[i];
-  }
+  uclchem_sparse_jacobian_pattern((int *)index_ptrs, (int *)index_vals);
 
   solver.LS = SUNLinSol_KLU(solver.yvec, solver.A, solver.sunctx);
   if (solver.LS == NULL) {
@@ -150,8 +148,13 @@ int uclchem_cvode_init(int neq, int nnz, const int *colptr, const int *rowind, u
     return CV_MEM_FAIL;
   }
 
+  retval = CVodeSetMaxOrd(solver.cvode_mem, 3);
+  if (retval != CV_SUCCESS) {
+    uclchem_cvode_free_solver();
+    return retval;
+  }
+
   solver.callbacks.rhs = rhs;
-  solver.callbacks.jac = jac;
   solver.callbacks.user_data = NULL;
   solver.initialized = 0;
 

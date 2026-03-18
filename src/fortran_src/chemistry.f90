@@ -17,8 +17,8 @@ USE physicscore, only: points, dstep, cloudsize, radfield, h2crprate, improvedH2
 USE network
 USE photoreactions
 USE surfacereactions
+USE jacobian, ONLY: jac_nnz, GETJACOBIAN_SPARSE_VALUES
 use f2py_constants, only: nspec, nreac
-USE jacobian_sparse, only: jac_neq, jac_nnz, jac_col_ptr, jac_row_ind, fill_sparse_jacobian_values
 USE postprocess_mod, only: lusecoldens,usepostprocess,tstep,lnh,lnh2,lnco,lnc
 USE rates
 USE odes
@@ -42,8 +42,10 @@ IMPLICIT NONE
     REAL(dp) :: MIN_ABUND = 1.0d-30 !Minimum abundance allowed
 
     INTEGER :: nion,ionlist(nspec)
-    LOGICAL :: warnedChargeJacobian = .FALSE.
-    PRIVATE :: cvode_rhs_c, cvode_jac_c, update_state_dependent_rates
+    LOGICAL :: cvode_log_open = .FALSE.
+    INTEGER, PARAMETER :: cvode_log_unit = 97
+    CHARACTER(len=*), PARAMETER :: cvode_log_path = "cvode_solver.log"
+    PRIVATE :: update_state_dependent_rates, ensure_cvode_log_open, log_cvode_event
 
     ! CVODE return codes from cvode/cvode.h
     INTEGER, PARAMETER :: CV_SUCCESS=0, CV_TSTOP_RETURN=1
@@ -57,12 +59,11 @@ IMPLICIT NONE
     INTEGER, PARAMETER :: CV_NO_MALLOC=-23, CV_CONTEXT_ERR=-32
 
     INTERFACE
-        INTEGER(c_int) FUNCTION uclchem_cvode_init(neq, nnz, colptr, rowind, rhs, jac) &
+        INTEGER(c_int) FUNCTION uclchem_cvode_init(neq, rhs) &
                 & BIND(C, name="uclchem_cvode_init")
             USE iso_c_binding, ONLY: c_int, c_funptr
-            INTEGER(c_int), VALUE :: neq, nnz
-            INTEGER(c_int), INTENT(IN) :: colptr(*), rowind(*)
-            TYPE(c_funptr), VALUE :: rhs, jac
+            INTEGER(c_int), VALUE :: neq
+            TYPE(c_funptr), VALUE :: rhs
         END FUNCTION uclchem_cvode_init
 
         INTEGER(c_int) FUNCTION uclchem_cvode_integrate(y, t, tout, reltol, abstol, mxstep) &
@@ -157,18 +158,17 @@ CONTAINS
            end if
         end do
         
-        IF (NEQ /= jac_neq) THEN
-            WRITE(*,*) "Analytic Jacobian size mismatch:", NEQ, jac_neq
-            STOP 1
-        END IF
+        CALL ensure_cvode_log_open(reset=.TRUE.)
+        CALL log_cvode_event("Initializing CVODE solver with sparse KLU linear solver")
 
         ISTATE = INT(uclchem_cvode_finalize(), KIND(ISTATE))
-        ISTATE = INT(uclchem_cvode_init(INT(NEQ, c_int), INT(jac_nnz, c_int), jac_col_ptr, jac_row_ind, &
-     &      c_funloc(cvode_rhs_c), c_funloc(cvode_jac_c)), KIND(ISTATE))
+        ISTATE = INT(uclchem_cvode_init(INT(NEQ, c_int), c_funloc(cvode_rhs_c)), KIND(ISTATE))
         IF (ISTATE /= CV_SUCCESS) THEN
-            WRITE(*,*) "Failed to initialize CVODE/KLU solver", ISTATE
+            WRITE(*,*) "Failed to initialize CVODE solver", ISTATE
+            CALL log_cvode_event("Failed to initialize CVODE solver", ISTATE)
             STOP 1
         END IF
+        CALL log_cvode_event("CVODE solver initialized", ISTATE)
 
         !ODE integrator settings
         ISTATE=1
@@ -302,32 +302,40 @@ CONTAINS
             CASE(CV_TOO_MUCH_WORK)
                 ! CVODE couldn't take enough steps before reaching targetTime
                 write(*,*) "ISTATE -1: Reducing time step to ", (targetTime-currentTime)*0.1/SECONDS_PER_YEAR, "years"
+                CALL log_cvode_event("CVODE too much work; reducing targetTime", ISTATE)
                 targetTime=currentTime+(targetTime-currentTime)*0.1
             CASE(CV_TOO_MUCH_ACC)
                 ! Tolerances are too small for machine precision
                 write(*,*) "ISTATE -2: Tolerances too small"
+                CALL log_cvode_event("CVODE tolerances too small; increasing abstol_factor", ISTATE)
                 abstol_factor=abstol_factor*10.0
             CASE(CV_MEM_FAIL, CV_MEM_NULL, CV_ILL_INPUT, CV_NO_MALLOC, CV_CONTEXT_ERR)
                 write(*,*) "CVODE found invalid inputs"
                 write(*,*) "abstol:"
                 write(*,*) abstol
+                CALL log_cvode_event("CVODE invalid input or memory/context failure", ISTATE)
                 successFlag=INT_UNRECOVERABLE_ERROR
                 RETURN
             CASE(CV_ERR_FAILURE, CV_CONV_FAILURE, CV_LINIT_FAIL, CV_LSETUP_FAIL, CV_LSOLVE_FAIL, &
                     & CV_NLS_INIT_FAIL, CV_NLS_SETUP_FAIL, CV_NLS_FAIL)
                 write(*,*) "ISTATE -4 - shortening step"
+                CALL log_cvode_event("CVODE nonlinear/linear solve failure; shortening step", ISTATE)
                 targetTime=currentTime+(targetTime-currentTime)*0.1
             CASE(CV_RHSFUNC_FAIL, CV_FIRST_RHSFUNC_ERR, CV_REPTD_RHSFUNC_ERR, CV_UNREC_RHSFUNC_ERR)
                 write(*,*) "CVODE RHS failure at time", timeInYears,"years"
+                CALL log_cvode_event("CVODE RHS failure", ISTATE)
                 successFlag=INT_UNRECOVERABLE_ERROR
                 RETURN
             CASE(CV_SUCCESS, CV_TSTOP_RETURN)
+                CALL log_cvode_event("CVODE step completed", ISTATE)
                 MXSTEP=10000
             CASE default
                 IF (ISTATE .lt. 0) THEN
                     write(*,*) "CVODE returned error code", ISTATE
+                    CALL log_cvode_event("CVODE returned unclassified negative code; shortening step", ISTATE)
                     targetTime=currentTime+(targetTime-currentTime)*0.1
                 ELSE
+                    CALL log_cvode_event("CVODE returned unclassified non-negative code", ISTATE)
                     MXSTEP=10000
                 END IF
         END SELECT
@@ -336,6 +344,56 @@ CONTAINS
         abund(nelec,dstep) = sum(abund(ionlist(1:nion),dstep))
     end if
     END SUBROUTINE integrateODESystem
+
+    SUBROUTINE ensure_cvode_log_open(reset)
+        LOGICAL, INTENT(IN), OPTIONAL :: reset
+        LOGICAL :: do_reset
+        INTEGER :: ios
+
+        do_reset = .FALSE.
+        IF (PRESENT(reset)) do_reset = reset
+
+        IF (cvode_log_open .AND. do_reset) THEN
+            CLOSE(cvode_log_unit)
+            cvode_log_open = .FALSE.
+        END IF
+
+        IF (.NOT. cvode_log_open) THEN
+            IF (do_reset) THEN
+                OPEN(unit=cvode_log_unit, file=cvode_log_path, status="replace", action="write", iostat=ios)
+            ELSE
+                OPEN(unit=cvode_log_unit, file=cvode_log_path, status="unknown", action="write", &
+                     & position="append", iostat=ios)
+            END IF
+
+            IF (ios == 0) THEN
+                cvode_log_open = .TRUE.
+            ELSE
+                WRITE(*,*) "WARNING: unable to open CVODE log file", TRIM(cvode_log_path), "iostat=", ios
+            END IF
+        END IF
+    END SUBROUTINE ensure_cvode_log_open
+
+    SUBROUTINE log_cvode_event(message, code)
+        CHARACTER(len=*), INTENT(IN) :: message
+        INTEGER, INTENT(IN), OPTIONAL :: code
+
+        CALL ensure_cvode_log_open()
+        IF (.NOT. cvode_log_open) RETURN
+
+        WRITE(cvode_log_unit,'(A)') REPEAT("-", 72)
+        WRITE(cvode_log_unit,'(A)') TRIM(message)
+        IF (PRESENT(code)) WRITE(cvode_log_unit,'(A,1X,I0)') "ISTATE:", code
+        WRITE(cvode_log_unit,'(A,1X,I0)') "dstep:", dstep
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "currentTime:", currentTime
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "targetTime:", targetTime
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "deltaTime:", targetTime-currentTime
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "timeInYears:", timeInYears
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "reltol:", reltol
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "abstol_factor:", abstol_factor
+        WRITE(cvode_log_unit,'(A,1X,I0)') "MXSTEP:", MXSTEP
+        FLUSH(cvode_log_unit)
+    END SUBROUTINE log_cvode_event
 
     INTEGER(c_int) FUNCTION cvode_rhs_c(t, y_ptr, ydot_ptr, user_data) BIND(C)
         REAL(c_double), VALUE :: t
@@ -350,31 +408,25 @@ CONTAINS
         cvode_rhs_c = 0_c_int
     END FUNCTION cvode_rhs_c
 
-    INTEGER(c_int) FUNCTION cvode_jac_c(t, y_ptr, fy_ptr, data_ptr, user_data) BIND(C)
+    INTEGER(c_int) FUNCTION cvode_sparse_jac_c(t, y_ptr, data_ptr) BIND(C, name="uclchem_cvode_sparse_jacobian")
         REAL(c_double), VALUE :: t
-        TYPE(c_ptr), VALUE :: y_ptr, fy_ptr, data_ptr, user_data
-        REAL(c_double), POINTER :: y(:), fy(:), jac_data(:)
-        REAL(dp) :: D, safeBulkLocal, bulkLayersReciprocalLocal, totalSwapLocal
+        TYPE(c_ptr), VALUE :: y_ptr, data_ptr
+        REAL(c_double), POINTER :: y(:), jac_data(:)
+        REAL(dp) :: D, totalSwapLocal
 
-        CALL c_f_pointer(y_ptr, y, [NEQ])
-        CALL c_f_pointer(fy_ptr, fy, [NEQ])
+        CALL c_f_pointer(y_ptr, y, [nspec + 1])
         CALL c_f_pointer(data_ptr, jac_data, [jac_nnz])
 
-        D = y(NEQ)
+        D = y(nspec + 1)
         CALL update_state_dependent_rates(y, D)
         safeMantle = MAX(1d-30, y(nSurface))
-        safeBulkLocal = MAX(1d-30, y(nBulk))
-        bulkLayersReciprocalLocal = MIN(1.0_dp, NUM_SITES_PER_GRAIN / (GAS_DUST_DENSITY_RATIO * safeBulkLocal))
-        totalSwapLocal = GETTOTALSWAP(RATE, y, bulkLayersReciprocalLocal)
-        CALL fill_sparse_jacobian_values(RATE, y, safeMantle, D, bulkLayersReciprocalLocal, totalSwapLocal, jac_data)
+        safeBulk = MAX(1d-30, y(nBulk))
+        bulkLayersReciprocal = MIN(1.0_dp, NUM_SITES_PER_GRAIN / (GAS_DUST_DENSITY_RATIO * safeBulk))
+        totalSwapLocal = GETTOTALSWAP(rate, y, bulkLayersReciprocal)
+        CALL GETJACOBIAN_SPARSE_VALUES(rate, y, safeMantle, D, bulkLayersReciprocal, totalSwapLocal, jac_data)
 
-        IF (enforceChargeConservation .AND. .NOT. warnedChargeJacobian) THEN
-            WRITE(*,*) "WARNING: analytic sparse Jacobian does not yet adjust the electron row for enforceChargeConservation=.true."
-            warnedChargeJacobian = .TRUE.
-        END IF
-
-        cvode_jac_c = 0_c_int
-    END FUNCTION cvode_jac_c
+        cvode_sparse_jac_c = 0_c_int
+    END FUNCTION cvode_sparse_jac_c
 
     SUBROUTINE update_state_dependent_rates(Y, D)
         REAL(dp), INTENT(IN) :: Y(:), D

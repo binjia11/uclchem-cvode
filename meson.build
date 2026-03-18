@@ -98,32 +98,16 @@ uclchem_fortran_source = files(fsource_dir / 'constants.f90',
                      fsource_dir / 'photoreactions.f90',
                      fsource_dir / 'rates.f90',
                      fsource_dir / 'odes.f90',
-                     fsource_dir / 'jacobian_sparse.f90',
+                     fsource_dir / 'jacobian.f90',
                      fsource_dir / 'chemistry.f90',
                      fsource_dir / 'io.f90',
                      fsource_dir / 'wrap.f90'
                     )
 cvode_bridge_source = files(fsource_dir / 'cvode_bridge.c')
-f2py_fortran_source = files(fsource_dir / 'constants.f90',
-                     fsource_dir / 'defaultparameters.f90',
-                     fsource_dir / 'f2py_constants.f90',
-                     fsource_dir / 'physics-core.f90',
-                     fsource_dir / 'network.f90',
-                     fsource_dir / 'cloud.f90',
-                     fsource_dir / 'hotcore.f90',
-                     fsource_dir / 'postprocess.f90',
-                     fsource_dir / 'surfacereactions.f90',
-                     fsource_dir / 'sputtering.f90',
-                     fsource_dir / 'cshock.f90',
-                     fsource_dir / 'jshock.f90',
-                     fsource_dir / 'collapse.f90',
-                     fsource_dir / 'photoreactions.f90',
-                     fsource_dir / 'rates.f90',
-                     fsource_dir / 'odes.f90',
-                     fsource_dir / 'chemistry.f90',
-                     fsource_dir / 'io.f90',
-                     fsource_dir / 'wrap.f90'
-                    )
+f2py_fortran_source = files(
+  fsource_dir / 'f2py_constants.f90',
+  fsource_dir / 'wrap.f90',
+)
 
 # Custom target to generate the f2py wrappers 
 uclchem_wrapper = custom_target('uclchemwrapmodule.c',
@@ -153,7 +137,7 @@ py.extension_module('uclchemwrap',
                      colamd_dep,
                      btf_dep,
                      ],
-                     fortran_args: ['-O3', '-fPIC', '-ffree-line-length-0'],
+                     fortran_args: ['-O0', '-fPIC', '-ffree-line-length-0'],
                      install : true)
 
 endif  # End of Fortran compilation section

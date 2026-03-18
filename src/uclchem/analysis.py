@@ -3,11 +3,6 @@ try:
 except ImportError as E:
     E.add_note("Failed to import wrap.f90 from uclchemwrap, did the installation with f2py succeed?")
     raise
-try:     
-    from uclchemwrap import surfacereactions
-except ImportError as E:
-    E.add_note("Failed to import surfacereactions.f90 from uclchemwrap, did the installation with f2py succeed?")
-    raise
 import os
 from typing import List
 
@@ -23,6 +18,11 @@ from uclchem.makerates.network import Network
 from uclchem.makerates.species import Species
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Mirror the fixed grain constants from surfacereactions.f90 so analysis does not
+# depend on F2PY exposing that whole module as a Python namespace.
+_GAS_DUST_DENSITY_RATIO = 756764593990.968
+_NUM_SITES_PER_GRAIN = 1884955.5924000004
 
 elementList = [
     "H",
@@ -767,12 +767,9 @@ def rates_to_dy_and_flux(
     if network:
         species = network.get_species_list()
         reactions = network.get_reaction_list()
-    # Import all of the constants directly from UCLCHEMWRAP to avoid discrepancies
-    GAS_DUST_DENSITY_RATIO = surfacereactions.gas_dust_density_ratio
-    NUM_SITES_PER_GRAIN = surfacereactions.num_sites_per_grain
     # Compute dynamic quantities that can be precomputed
     bulkLayersReciprocal = (
-        NUM_SITES_PER_GRAIN / (GAS_DUST_DENSITY_RATIO * abundances["BULK"])
+        _NUM_SITES_PER_GRAIN / (_GAS_DUST_DENSITY_RATIO * abundances["BULK"])
     ).apply(lambda x: min(1.0, x))
     totalSwap = bulkLayersReciprocal * get_total_swap(rates, abundances, reactions)
 
