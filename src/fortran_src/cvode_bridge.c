@@ -31,12 +31,16 @@ struct uclchem_cvode_solver {
   N_Vector yvec;
   N_Vector abstol_vec;
   N_Vector precond_diag;
+  N_Vector precond_rhs;
   SUNMatrix A;
+  SUNMatrix P;
   SUNLinearSolver LS;
+  SUNLinearSolver PLS;
   struct uclchem_callback_data callbacks;
   sunindextype neq;
   sunindextype nnz;
   int linear_solver_kind;
+  int spgmr_preconditioner_kind;
   int initialized;
   int sparse_jac_current;
   realtype cached_gamma;
@@ -48,6 +52,7 @@ enum {
   UCLCHEM_LINEAR_DENSE = 1,
   UCLCHEM_LINEAR_SPGMR = 2
 };
+enum { UCLCHEM_SPGMR_PRECOND_DIAG = 0, UCLCHEM_SPGMR_PRECOND_KLU = 1 };
 
 static void uclchem_append_cvode_log(const char *fmt, ...) {
   FILE *fp;
@@ -117,6 +122,18 @@ static void uclchem_log_solver_diagnostics(const char *stage, int cvode_flag) {
   } else if (solver.linear_solver_kind == UCLCHEM_LINEAR_SPGMR && solver.LS != NULL) {
     sunindextype spgmr_last_flag = SUNLinSolLastFlag_SPGMR(solver.LS);
     uclchem_append_cvode_log("SPGMR diagnostics: last_flag=%ld", (long)spgmr_last_flag);
+    if (solver.spgmr_preconditioner_kind == UCLCHEM_SPGMR_PRECOND_KLU && solver.PLS != NULL) {
+      sunindextype klu_prec_last_flag = SUNLinSolLastFlag_KLU(solver.PLS);
+      sun_klu_common *common = SUNLinSol_KLUGetCommon(solver.PLS);
+      uclchem_append_cvode_log("SPGMR KLU preconditioner diagnostics: last_flag=%ld",
+                               (long)klu_prec_last_flag);
+      if (common != NULL) {
+        uclchem_append_cvode_log("SPGMR KLU common: status=%d nrealloc=%d structural_rank=%d numerical_rank=%d singular_col=%d noffdiag=%d rcond=%.17g condest=%.17g rgrowth=%.17g",
+                                 common->status, common->nrealloc, common->structural_rank,
+                                 common->numerical_rank, common->singular_col, common->noffdiag,
+                                 common->rcond, common->condest, common->rgrowth);
+      }
+    }
   }
 }
 
@@ -180,9 +197,32 @@ static const char *uclchem_linear_solver_name(int linear_solver_kind) {
   }
 }
 
+static const char *uclchem_spgmr_preconditioner_name(int preconditioner_kind) {
+  switch (preconditioner_kind) {
+  case UCLCHEM_SPGMR_PRECOND_KLU:
+    return "klu";
+  case UCLCHEM_SPGMR_PRECOND_DIAG:
+  default:
+    return "diag";
+  }
+}
+
 static int uclchem_solver_uses_sparse_jacobian(int linear_solver_kind) {
   return linear_solver_kind == UCLCHEM_LINEAR_SPARSE_KLU ||
          linear_solver_kind == UCLCHEM_LINEAR_SPGMR;
+}
+
+static int uclchem_spgmr_preconditioner_kind_from_env(void) {
+  const char *value = getenv("UCLCHEM_SPGMR_PRECONDITIONER");
+
+  if (value == NULL || *value == '\0') {
+    return UCLCHEM_SPGMR_PRECOND_KLU;
+  }
+  if (strcmp(value, "diag") == 0 || strcmp(value, "DIAG") == 0 ||
+      strcmp(value, "diagonal") == 0 || strcmp(value, "DIAGONAL") == 0) {
+    return UCLCHEM_SPGMR_PRECOND_DIAG;
+  }
+  return UCLCHEM_SPGMR_PRECOND_KLU;
 }
 
 static int uclchem_linear_solver_kind_from_env(void) {
@@ -310,8 +350,9 @@ static void uclchem_configure_spgmr(SUNLinearSolver LS) {
     uclchem_append_cvode_log("SPGMR config: failed to set gstype=%d retval=%d", gstype, retval);
   }
 
-  uclchem_append_cvode_log("SPGMR config: maxl=%d max_restarts=%d gstype=%d",
-                           uclchem_env_int("UCLCHEM_SPGMR_MAXL", 30), max_restarts, gstype);
+  uclchem_append_cvode_log("SPGMR config: maxl=%d max_restarts=%d gstype=%d preconditioner=%s",
+                           uclchem_env_int("UCLCHEM_SPGMR_MAXL", 30), max_restarts, gstype,
+                           uclchem_spgmr_preconditioner_name(solver.spgmr_preconditioner_kind));
 }
 
 static int uclchem_fill_sparse_jacobian_values(realtype t, N_Vector y) {
@@ -415,6 +456,51 @@ static int uclchem_build_diag_preconditioner(realtype gamma) {
   return 0;
 }
 
+static int uclchem_build_klu_preconditioner_matrix(realtype gamma) {
+  realtype *jac_data;
+  realtype *prec_data;
+  sunindextype *index_ptrs;
+  sunindextype *index_vals;
+  sunindextype col;
+  sunindextype idx;
+
+  if (solver.A == NULL || solver.P == NULL) {
+    return CVLS_MEM_NULL;
+  }
+
+  jac_data = SM_DATA_S(solver.A);
+  prec_data = SM_DATA_S(solver.P);
+  index_ptrs = SM_INDEXPTRS_S(solver.P);
+  index_vals = SM_INDEXVALS_S(solver.P);
+  if (jac_data == NULL || prec_data == NULL || index_ptrs == NULL || index_vals == NULL) {
+    return CVLS_MEM_FAIL;
+  }
+
+  for (idx = 0; idx < solver.nnz; ++idx) {
+    prec_data[idx] = -gamma * jac_data[idx];
+  }
+
+  for (col = 0; col < solver.neq; ++col) {
+    int found_diag = 0;
+    for (idx = index_ptrs[col]; idx < index_ptrs[col + 1]; ++idx) {
+      if (index_vals[idx] == col) {
+        prec_data[idx] += 1.0;
+        found_diag = 1;
+        break;
+      }
+    }
+
+    if (!found_diag) {
+      uclchem_append_cvode_log("SPGMR KLU preconditioner: missing diagonal entry for column=%ld",
+                               (long)col);
+      return 1;
+    }
+  }
+
+  solver.cached_gamma = gamma;
+  return 0;
+}
+
 static int jtimes_setup_bridge(realtype t, N_Vector y, N_Vector fy, void *user_data) {
   int retval;
 
@@ -469,6 +555,21 @@ static int prec_setup_bridge(realtype t, N_Vector y, N_Vector fy, booleantype jo
     *jcurPtr = SUNFALSE;
   }
 
+  if (solver.spgmr_preconditioner_kind == UCLCHEM_SPGMR_PRECOND_KLU) {
+    retval = uclchem_build_klu_preconditioner_matrix(gamma);
+    if (retval != 0) {
+      return retval;
+    }
+
+    retval = SUNLinSolSetup(solver.PLS, solver.P);
+    if (retval != SUNLS_SUCCESS) {
+      uclchem_append_cvode_log("SPGMR KLU preconditioner: setup failed retval=%d", retval);
+      return 1;
+    }
+
+    return 0;
+  }
+
   return uclchem_build_diag_preconditioner(gamma);
 }
 
@@ -477,6 +578,8 @@ static int prec_solve_bridge(realtype t, N_Vector y, N_Vector fy, N_Vector r, N_
   realtype *r_data;
   realtype *z_data;
   realtype *diag_inv;
+  realtype *rhs_data;
+  int retval;
   sunindextype i;
 
   (void)t;
@@ -486,6 +589,30 @@ static int prec_solve_bridge(realtype t, N_Vector y, N_Vector fy, N_Vector r, N_
   (void)delta;
   (void)lr;
   (void)user_data;
+
+  if (solver.spgmr_preconditioner_kind == UCLCHEM_SPGMR_PRECOND_KLU) {
+    if (solver.PLS == NULL || solver.P == NULL || solver.precond_rhs == NULL) {
+      return CVLS_PMEM_NULL;
+    }
+
+    r_data = N_VGetArrayPointer_Serial(r);
+    rhs_data = N_VGetArrayPointer_Serial(solver.precond_rhs);
+    if (r_data == NULL || rhs_data == NULL) {
+      return CVLS_MEM_FAIL;
+    }
+
+    for (i = 0; i < solver.neq; ++i) {
+      rhs_data[i] = r_data[i];
+    }
+
+    retval = SUNLinSolSolve(solver.PLS, solver.P, z, solver.precond_rhs, 0.0);
+    if (retval != SUNLS_SUCCESS) {
+      uclchem_append_cvode_log("SPGMR KLU preconditioner: solve failed retval=%d", retval);
+      return 1;
+    }
+
+    return 0;
+  }
 
   if (solver.precond_diag == NULL) {
     return CVLS_PMEM_NULL;
@@ -509,11 +636,20 @@ static void uclchem_cvode_free_solver(void) {
   if (solver.cvode_mem != NULL) {
     CVodeFree(&solver.cvode_mem);
   }
+  if (solver.PLS != NULL) {
+    SUNLinSolFree(solver.PLS);
+  }
   if (solver.LS != NULL) {
     SUNLinSolFree(solver.LS);
   }
+  if (solver.P != NULL) {
+    SUNMatDestroy(solver.P);
+  }
   if (solver.A != NULL) {
     SUNMatDestroy(solver.A);
+  }
+  if (solver.precond_rhs != NULL) {
+    N_VDestroy(solver.precond_rhs);
   }
   if (solver.precond_diag != NULL) {
     N_VDestroy(solver.precond_diag);
@@ -550,7 +686,12 @@ int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
 
   solver.neq = (sunindextype)neq;
   solver.linear_solver_kind = uclchem_linear_solver_kind_from_env();
-  uclchem_append_cvode_log("CVODE init: linear_solver=%s", uclchem_linear_solver_name(solver.linear_solver_kind));
+  solver.spgmr_preconditioner_kind =
+      (solver.linear_solver_kind == UCLCHEM_LINEAR_SPGMR) ? uclchem_spgmr_preconditioner_kind_from_env()
+                                                          : UCLCHEM_SPGMR_PRECOND_DIAG;
+  uclchem_append_cvode_log("CVODE init: linear_solver=%s spgmr_preconditioner=%s",
+                           uclchem_linear_solver_name(solver.linear_solver_kind),
+                           uclchem_spgmr_preconditioner_name(solver.spgmr_preconditioner_kind));
 
   if (uclchem_solver_uses_sparse_jacobian(solver.linear_solver_kind)) {
     nnz = uclchem_sparse_jacobian_nnz();
@@ -600,8 +741,38 @@ int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
       }
 
       solver.LS = SUNLinSol_SPGMR(solver.yvec, SUN_PREC_LEFT, maxl, solver.sunctx);
-      solver.precond_diag = N_VClone(solver.yvec);
-      if (solver.LS == NULL || solver.precond_diag == NULL) {
+      if (solver.spgmr_preconditioner_kind == UCLCHEM_SPGMR_PRECOND_KLU) {
+        solver.P = SUNSparseMatrix(solver.neq, solver.neq, solver.nnz, CSC_MAT, solver.sunctx);
+        if (solver.P == NULL) {
+          uclchem_cvode_free_solver();
+          return CV_MEM_FAIL;
+        }
+
+        index_ptrs = SM_INDEXPTRS_S(solver.P);
+        index_vals = SM_INDEXVALS_S(solver.P);
+        if (index_ptrs == NULL || index_vals == NULL) {
+          uclchem_cvode_free_solver();
+          return CV_MEM_FAIL;
+        }
+        uclchem_sparse_jacobian_pattern((int *)index_ptrs, (int *)index_vals);
+
+        solver.PLS = SUNLinSol_KLU(solver.yvec, solver.P, solver.sunctx);
+        solver.precond_rhs = N_VClone(solver.yvec);
+        if (solver.LS == NULL || solver.PLS == NULL || solver.precond_rhs == NULL) {
+          uclchem_cvode_free_solver();
+          return CV_MEM_FAIL;
+        }
+
+        uclchem_configure_klu(solver.PLS);
+      } else {
+        solver.precond_diag = N_VClone(solver.yvec);
+        if (solver.LS == NULL || solver.precond_diag == NULL) {
+          uclchem_cvode_free_solver();
+          return CV_MEM_FAIL;
+        }
+      }
+
+      if (solver.LS == NULL) {
         uclchem_cvode_free_solver();
         return CV_MEM_FAIL;
       }
@@ -656,6 +827,19 @@ int uclchem_cvode_integrate(double *y, double *t, double tout, double reltol, co
   if (solver.cvode_mem == NULL || solver.yvec == NULL || solver.abstol_vec == NULL ||
       solver.LS == NULL || (solver.linear_solver_kind != UCLCHEM_LINEAR_SPGMR && solver.A == NULL)) {
     return CV_NO_MALLOC;
+  }
+  if (solver.linear_solver_kind == UCLCHEM_LINEAR_SPGMR) {
+    if (solver.A == NULL) {
+      return CV_NO_MALLOC;
+    }
+    if (solver.spgmr_preconditioner_kind == UCLCHEM_SPGMR_PRECOND_KLU &&
+        (solver.P == NULL || solver.PLS == NULL || solver.precond_rhs == NULL)) {
+      return CV_NO_MALLOC;
+    }
+    if (solver.spgmr_preconditioner_kind == UCLCHEM_SPGMR_PRECOND_DIAG &&
+        solver.precond_diag == NULL) {
+      return CV_NO_MALLOC;
+    }
   }
   if (y == NULL || t == NULL || abstol == NULL) {
     return CV_ILL_INPUT;

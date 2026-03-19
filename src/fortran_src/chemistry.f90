@@ -179,7 +179,7 @@ CONTAINS
         & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "GMRES" .OR. &
         & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "iterative" .OR. &
         & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "ITERATIVE")) THEN
-            CALL log_cvode_event("Initializing CVODE solver with SPGMR diagonal preconditioner")
+            CALL log_cvode_event("Initializing CVODE solver with SPGMR preconditioner")
         ELSE
             CALL log_cvode_event("Initializing CVODE solver with sparse KLU linear solver")
         END IF
