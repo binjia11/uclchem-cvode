@@ -22,7 +22,7 @@ ifneq ($(strip $(SUNDIALS_PREFIX)),)
 SUNDIALS_CFLAGS += -I$(SUNDIALS_PREFIX)/include
 SUNDIALS_LDFLAGS += -L$(SUNDIALS_PREFIX)/lib
 endif
-SUNDIALS_LIBS = -lsundials_cvode -lsundials_nvecserial -lsundials_sunlinsolklu -lsundials_sunmatrixsparse -lsundials_generic -lklu -lamd -lcolamd -lbtf
+SUNDIALS_LIBS = -lsundials_cvode -lsundials_nvecserial -lsundials_sunlinsoldense -lsundials_sunmatrixdense -lsundials_sunlinsolklu -lsundials_sunmatrixsparse -lsundials_generic -lklu -lamd -lcolamd -lbtf
 
 
 ###############################################################################

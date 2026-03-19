@@ -74,6 +74,8 @@ endif
 
 sundials_cvode_dep = cc.find_library('sundials_cvode', dirs: sundials_lib_dirs, required: true)
 sundials_nvecserial_dep = cc.find_library('sundials_nvecserial', dirs: sundials_lib_dirs, required: true)
+sundials_sunlinsoldense_dep = cc.find_library('sundials_sunlinsoldense', dirs: sundials_lib_dirs, required: true)
+sundials_sunmatrixdense_dep = cc.find_library('sundials_sunmatrixdense', dirs: sundials_lib_dirs, required: true)
 sundials_sunlinsolklu_dep = cc.find_library('sundials_sunlinsolklu', dirs: sundials_lib_dirs, required: true)
 sundials_sunmatrixsparse_dep = cc.find_library('sundials_sunmatrixsparse', dirs: sundials_lib_dirs, required: true)
 sundials_generic_dep = cc.find_library('sundials_generic', dirs: sundials_lib_dirs, required: true)
@@ -129,6 +131,8 @@ py.extension_module('uclchemwrap',
                      quadmath_dep,
                      sundials_cvode_dep,
                      sundials_nvecserial_dep,
+                     sundials_sunlinsoldense_dep,
+                     sundials_sunmatrixdense_dep,
                      sundials_sunlinsolklu_dep,
                      sundials_sunmatrixsparse_dep,
                      sundials_generic_dep,

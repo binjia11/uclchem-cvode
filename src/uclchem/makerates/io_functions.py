@@ -622,6 +622,17 @@ def write_jacobian(file_name: Path, species_list: list[Species]) -> None:
         output.write("    END DO\n")
         output.write("END SUBROUTINE uclchem_sparse_jacobian_pattern\n")
         output.write(
+            "SUBROUTINE GETJACOBIAN_DENSE(RATE, Y, safeMantle, D, bulkLayersReciprocal, totalSwap, J)\n"
+        )
+        output.write(
+            "REAL(dp), INTENT(IN) :: RATE(:), Y(:), safeMantle, D, bulkLayersReciprocal, totalSwap\n"
+        )
+        output.write("REAL(dp), INTENT(OUT) :: J(jac_neq, jac_neq)\n")
+        output.write("J=0.0_dp\n")
+        for row, col, expr in entries:
+            output.write(truncate_line(f"    J({row},{col})={expr}\n"))
+        output.write("END SUBROUTINE GETJACOBIAN_DENSE\n")
+        output.write(
             "SUBROUTINE GETJACOBIAN_SPARSE_VALUES(RATE, Y, safeMantle, D, bulkLayersReciprocal, totalSwap, JDATA)\n"
         )
         output.write(
@@ -637,6 +648,19 @@ def write_jacobian(file_name: Path, species_list: list[Species]) -> None:
                     expr = "0.0_dp"
             output.write(truncate_line(f"    JDATA({idx})={expr}\n"))
         output.write("END SUBROUTINE GETJACOBIAN_SPARSE_VALUES\n")
+        output.write("SUBROUTINE SPARSE_VALUES_TO_DENSE(JDATA, J)\n")
+        output.write("REAL(dp), INTENT(IN) :: JDATA(:)\n")
+        output.write("REAL(dp), INTENT(OUT) :: J(jac_neq, jac_neq)\n")
+        output.write("INTEGER :: col, idx_start, idx_end, idx\n")
+        output.write("J=0.0_dp\n")
+        output.write("DO col = 1, jac_neq\n")
+        output.write("    idx_start = jac_col_ptr(col) + 1\n")
+        output.write("    idx_end = jac_col_ptr(col + 1)\n")
+        output.write("    DO idx = idx_start, idx_end\n")
+        output.write("        J(jac_row_ind(idx) + 1, col) = JDATA(idx)\n")
+        output.write("    END DO\n")
+        output.write("END DO\n")
+        output.write("END SUBROUTINE SPARSE_VALUES_TO_DENSE\n")
         output.write("REAL(dp) FUNCTION ddensdensdot(D)\n")
         output.write("    REAL(dp), INTENT(IN) :: D\n")
         output.write("    REAL(dp) :: safeD\n")

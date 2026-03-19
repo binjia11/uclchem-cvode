@@ -634,9 +634,11 @@ CONTAINS
         ! Initialize the chemistry
         CALL initializeChemistry(readAbunds)
         IF (returnArray .AND. givestartabund) THEN
-            ! In case we have custom abundances, set them here
+            ! starting_chemistry only contains species abundances. The density row
+            ! is owned by the physics setup and must not be read past the Python buffer.
             DO l=1,points
-                abund(:nspec+1,l) = abundanceStart(:nspec+1)
+                abund(:nspec,l) = abundanceStart(:nspec)
+                abund(neq,l) = density(l)
             END DO
         ELSE
             ! Else just use the default readInputAbunds routine:
@@ -883,6 +885,8 @@ CONTAINS
                     READ(inputValue,*,iostat=successFlag) abstol_factor
                 CASE('abstol_min')
                     READ(inputValue,*,iostat=successFlag) abstol_min
+                CASE('mxstep')
+                    READ(inputValue,*,iostat=successFlag) mxstep
                 ! CASE('jacobian')
                 !     READ(inputValue,*) jacobian
                 CASE('abundsavefile')

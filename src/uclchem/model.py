@@ -100,6 +100,22 @@ def _create_ratesarray(points, nReacs, timepoints=TIMEPOINTS):
     return np.zeros(shape=(timepoints + 1, points, nReacs), dtype=np.float64, order="F")
 
 
+def _normalize_starting_chemistry(starting_chemistry):
+    if starting_chemistry is None:
+        return None
+
+    arr = np.asarray(starting_chemistry, dtype=np.float64).reshape(-1)
+    if arr.size == n_species + 1:
+        arr = arr[:n_species]
+    elif arr.size != n_species:
+        raise ValueError(
+            f"starting_chemistry must contain {n_species} species abundances"
+            f" (or {n_species + 1} values including a trailing density entry); got {arr.size}"
+        )
+
+    return np.asfortranarray(arr)
+
+
 def pre_flight_checklist(
     return_array,
     return_dataframe,
@@ -256,6 +272,7 @@ def cloud(
             - success_flag (integer): which is negative if the model failed to run and can be sent to `uclchem.utils.check_error()` to see more details.
     """
     give_start_abund = starting_chemistry is not None
+    starting_chemistry = _normalize_starting_chemistry(starting_chemistry)
     n_out, param_dict, out_species = _reform_inputs(param_dict, out_species)
     if "points" not in param_dict:
         param_dict["points"] = 1
@@ -363,6 +380,7 @@ def collapse(
     if not write_physics:
         physics_output = ""
     give_start_abund = starting_chemistry is not None
+    starting_chemistry = _normalize_starting_chemistry(starting_chemistry)
 
     n_out, param_dict, out_species = _reform_inputs(param_dict, out_species)
     if "points" not in param_dict:
@@ -480,6 +498,7 @@ def hot_core(
         param_dict["points"], n_reactions, timepoints=timepoints
     )
     give_start_abund = starting_chemistry is not None
+    starting_chemistry = _normalize_starting_chemistry(starting_chemistry)
     _, _, _, abunds, specname, success_flag = wrap.hot_core(
         temp_indx=temp_indx,
         max_temp=max_temperature,
@@ -583,6 +602,7 @@ def cshock(
         param_dict["points"], n_reactions, timepoints=timepoints
     )
     give_start_abund = starting_chemistry is not None
+    starting_chemistry = _normalize_starting_chemistry(starting_chemistry)
     _, _, _, abunds, disspation_time, specname, success_flag = wrap.cshock(
         shock_vel=shock_vel,
         timestep_factor=timestep_factor,
@@ -693,6 +713,7 @@ def jshock(
         param_dict, N_PHYSICAL_PARAMETERS, timepoints=timepoints
     )
     give_start_abund = starting_chemistry is not None
+    starting_chemistry = _normalize_starting_chemistry(starting_chemistry)
     ratesArray = _create_ratesarray(
         param_dict["points"], n_reactions, timepoints=timepoints
     )
@@ -809,6 +830,7 @@ def postprocess(
             array = np.asfortranarray(array, dtype=np.float64)
             postprocess_arrays[key] = array
     give_start_abund = starting_chemistry is not None
+    starting_chemistry = _normalize_starting_chemistry(starting_chemistry)
 
     if not give_start_abund:
         starting_chemistry = np.zeros(

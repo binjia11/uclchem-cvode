@@ -17,7 +17,7 @@ USE physicscore, only: points, dstep, cloudsize, radfield, h2crprate, improvedH2
 USE network
 USE photoreactions
 USE surfacereactions
-USE jacobian, ONLY: jac_nnz, GETJACOBIAN_SPARSE_VALUES
+USE jacobian, ONLY: jac_nnz, GETJACOBIAN_DENSE, GETJACOBIAN_SPARSE_VALUES, SPARSE_VALUES_TO_DENSE
 use f2py_constants, only: nspec, nreac
 USE postprocess_mod, only: lusecoldens,usepostprocess,tstep,lnh,lnh2,lnco,lnc
 USE rates
@@ -45,7 +45,11 @@ IMPLICIT NONE
     LOGICAL :: cvode_log_open = .FALSE.
     INTEGER, PARAMETER :: cvode_log_unit = 97
     CHARACTER(len=*), PARAMETER :: cvode_log_path = "cvode_solver.log"
-    PRIVATE :: update_state_dependent_rates, ensure_cvode_log_open, log_cvode_event
+    LOGICAL :: jac_debug_enabled = .FALSE.
+    INTEGER :: jac_debug_max_calls = 0
+    INTEGER :: jac_debug_call_count = 0
+    PRIVATE :: update_state_dependent_rates, ensure_cvode_log_open, log_cvode_event, &
+    & prepare_jacobian_state, configure_jacobian_debug, log_jacobian_comparison
 
     ! CVODE return codes from cvode/cvode.h
     INTEGER, PARAMETER :: CV_SUCCESS=0, CV_TSTOP_RETURN=1
@@ -84,6 +88,8 @@ CONTAINS
     SUBROUTINE initializeChemistry(readAbunds)
         LOGICAL, INTENT(IN) :: readAbunds
         !f2py integer, intent(aux) :: points
+        CHARACTER(len=32) :: linear_solver_env
+        INTEGER :: env_length, env_status
 
         ! Sets variables at the start of every run.
         ! Since python module persists, it's not enough to set initial
@@ -159,7 +165,16 @@ CONTAINS
         end do
         
         CALL ensure_cvode_log_open(reset=.TRUE.)
-        CALL log_cvode_event("Initializing CVODE solver with sparse KLU linear solver")
+        CALL configure_jacobian_debug()
+        CALL get_environment_variable("UCLCHEM_CVODE_LINEAR_SOLVER", linear_solver_env, &
+        & length=env_length, status=env_status)
+        IF (env_status == 0 .AND. env_length > 0 .AND. &
+        & (TRIM(ADJUSTL(linear_solver_env(:env_length))) == "dense" .OR. &
+        & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "DENSE")) THEN
+            CALL log_cvode_event("Initializing CVODE solver with dense linear solver")
+        ELSE
+            CALL log_cvode_event("Initializing CVODE solver with sparse KLU linear solver")
+        END IF
 
         ISTATE = INT(uclchem_cvode_finalize(), KIND(ISTATE))
         ISTATE = INT(uclchem_cvode_init(INT(NEQ, c_int), c_funloc(cvode_rhs_c)), KIND(ISTATE))
@@ -395,6 +410,98 @@ CONTAINS
         FLUSH(cvode_log_unit)
     END SUBROUTINE log_cvode_event
 
+    SUBROUTINE configure_jacobian_debug()
+        CHARACTER(len=32) :: env_value
+        INTEGER :: env_length, env_status
+
+        jac_debug_enabled = .FALSE.
+        jac_debug_max_calls = 0
+        jac_debug_call_count = 0
+
+        CALL get_environment_variable("UCLCHEM_JAC_DEBUG", env_value, length=env_length, status=env_status)
+        IF (env_status /= 0 .OR. env_length <= 0) RETURN
+
+        SELECT CASE (TRIM(ADJUSTL(env_value(:env_length))))
+            CASE ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+                jac_debug_enabled = .TRUE.
+            CASE DEFAULT
+                RETURN
+        END SELECT
+
+        jac_debug_max_calls = 8
+        CALL get_environment_variable("UCLCHEM_JAC_DEBUG_MAX_CALLS", env_value, length=env_length, status=env_status)
+        IF (env_status == 0 .AND. env_length > 0) THEN
+            READ(env_value(:env_length), *, ERR=10) jac_debug_max_calls
+10          CONTINUE
+        END IF
+    END SUBROUTINE configure_jacobian_debug
+
+    SUBROUTINE prepare_jacobian_state(Y, D, totalSwapLocal)
+        REAL(dp), INTENT(IN) :: Y(:), D
+        REAL(dp), INTENT(OUT) :: totalSwapLocal
+
+        CALL update_state_dependent_rates(Y, D)
+        safeMantle = MAX(1d-30, Y(nSurface))
+        safeBulk = MAX(1d-30, Y(nBulk))
+        bulkLayersReciprocal = MIN(1.0_dp, NUM_SITES_PER_GRAIN / (GAS_DUST_DENSITY_RATIO * safeBulk))
+        totalSwapLocal = GETTOTALSWAP(rate, Y, bulkLayersReciprocal)
+    END SUBROUTINE prepare_jacobian_state
+
+    SUBROUTINE log_jacobian_comparison(t, Y, dense_jac, sparse_values)
+        REAL(dp), INTENT(IN) :: t, Y(:)
+        REAL(dp), INTENT(IN) :: dense_jac(:,:), sparse_values(:)
+        REAL(dp) :: sparse_dense(NEQ, NEQ)
+        REAL(dp) :: abs_diff, rel_diff, denom, max_abs_diff, max_rel_diff
+        REAL(dp) :: dense_value, sparse_value
+        INTEGER :: row, col, worst_row, worst_col, mismatch_count
+
+        IF (.NOT. jac_debug_enabled) RETURN
+        IF (jac_debug_call_count >= jac_debug_max_calls) RETURN
+
+        CALL SPARSE_VALUES_TO_DENSE(sparse_values, sparse_dense)
+
+        max_abs_diff = 0.0_dp
+        max_rel_diff = 0.0_dp
+        mismatch_count = 0
+        worst_row = 1
+        worst_col = 1
+        dense_value = dense_jac(1,1)
+        sparse_value = sparse_dense(1,1)
+
+        DO col = 1, NEQ
+            DO row = 1, NEQ
+                abs_diff = ABS(dense_jac(row, col) - sparse_dense(row, col))
+                denom = MAX(ABS(dense_jac(row, col)), ABS(sparse_dense(row, col)), 1.0d-30)
+                rel_diff = abs_diff / denom
+                IF (abs_diff > 1.0d-12 .AND. rel_diff > 1.0d-10) mismatch_count = mismatch_count + 1
+                IF (abs_diff > max_abs_diff) THEN
+                    max_abs_diff = abs_diff
+                    max_rel_diff = rel_diff
+                    worst_row = row
+                    worst_col = col
+                    dense_value = dense_jac(row, col)
+                    sparse_value = sparse_dense(row, col)
+                END IF
+            END DO
+        END DO
+
+        jac_debug_call_count = jac_debug_call_count + 1
+        CALL ensure_cvode_log_open()
+        IF (.NOT. cvode_log_open) RETURN
+
+        WRITE(cvode_log_unit,'(A)') REPEAT("=", 72)
+        WRITE(cvode_log_unit,'(A,1X,I0)') "Jacobian compare call:", jac_debug_call_count
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "callback_t:", t
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "state_density:", Y(NEQ)
+        WRITE(cvode_log_unit,'(A,1X,I0)') "mismatch_count:", mismatch_count
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "max_abs_diff:", max_abs_diff
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "max_rel_diff:", max_rel_diff
+        WRITE(cvode_log_unit,'(A,1X,I0,A,I0)') "worst_entry:", worst_row, ",", worst_col
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "dense_value:", dense_value
+        WRITE(cvode_log_unit,'(A,1X,ES24.16)') "sparse_value:", sparse_value
+        FLUSH(cvode_log_unit)
+    END SUBROUTINE log_jacobian_comparison
+
     INTEGER(c_int) FUNCTION cvode_rhs_c(t, y_ptr, ydot_ptr, user_data) BIND(C)
         REAL(c_double), VALUE :: t
         TYPE(c_ptr), VALUE :: y_ptr, ydot_ptr, user_data
@@ -413,20 +520,42 @@ CONTAINS
         TYPE(c_ptr), VALUE :: y_ptr, data_ptr
         REAL(c_double), POINTER :: y(:), jac_data(:)
         REAL(dp) :: D, totalSwapLocal
+        REAL(dp) :: dense_jac(NEQ, NEQ)
 
         CALL c_f_pointer(y_ptr, y, [nspec + 1])
         CALL c_f_pointer(data_ptr, jac_data, [jac_nnz])
 
         D = y(nspec + 1)
-        CALL update_state_dependent_rates(y, D)
-        safeMantle = MAX(1d-30, y(nSurface))
-        safeBulk = MAX(1d-30, y(nBulk))
-        bulkLayersReciprocal = MIN(1.0_dp, NUM_SITES_PER_GRAIN / (GAS_DUST_DENSITY_RATIO * safeBulk))
-        totalSwapLocal = GETTOTALSWAP(rate, y, bulkLayersReciprocal)
+        CALL prepare_jacobian_state(y, D, totalSwapLocal)
         CALL GETJACOBIAN_SPARSE_VALUES(rate, y, safeMantle, D, bulkLayersReciprocal, totalSwapLocal, jac_data)
+        IF (jac_debug_enabled .AND. jac_debug_call_count < jac_debug_max_calls) THEN
+            CALL GETJACOBIAN_DENSE(rate, y, safeMantle, D, bulkLayersReciprocal, totalSwapLocal, dense_jac)
+            CALL log_jacobian_comparison(REAL(t, dp), y, dense_jac, jac_data)
+        END IF
 
         cvode_sparse_jac_c = 0_c_int
     END FUNCTION cvode_sparse_jac_c
+
+    INTEGER(c_int) FUNCTION cvode_dense_jac_c(t, y_ptr, data_ptr) BIND(C, name="uclchem_cvode_dense_jacobian")
+        REAL(c_double), VALUE :: t
+        TYPE(c_ptr), VALUE :: y_ptr, data_ptr
+        REAL(c_double), POINTER :: y(:), jac_dense(:,:)
+        REAL(dp) :: D, totalSwapLocal
+        REAL(dp) :: sparse_values(jac_nnz)
+
+        CALL c_f_pointer(y_ptr, y, [nspec + 1])
+        CALL c_f_pointer(data_ptr, jac_dense, [NEQ, NEQ])
+
+        D = y(nspec + 1)
+        CALL prepare_jacobian_state(y, D, totalSwapLocal)
+        CALL GETJACOBIAN_DENSE(rate, y, safeMantle, D, bulkLayersReciprocal, totalSwapLocal, jac_dense)
+        IF (jac_debug_enabled .AND. jac_debug_call_count < jac_debug_max_calls) THEN
+            CALL GETJACOBIAN_SPARSE_VALUES(rate, y, safeMantle, D, bulkLayersReciprocal, totalSwapLocal, sparse_values)
+            CALL log_jacobian_comparison(REAL(t, dp), y, jac_dense, sparse_values)
+        END IF
+
+        cvode_dense_jac_c = 0_c_int
+    END FUNCTION cvode_dense_jac_c
 
     SUBROUTINE update_state_dependent_rates(Y, D)
         REAL(dp), INTENT(IN) :: Y(:), D
