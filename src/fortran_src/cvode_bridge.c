@@ -3,10 +3,12 @@
 #include <nvector/nvector_serial.h>
 #include <sunlinsol/sunlinsol_dense.h>
 #include <sunlinsol/sunlinsol_klu.h>
+#include <sunlinsol/sunlinsol_spgmr.h>
 #include <sunmatrix/sunmatrix_dense.h>
 #include <sunmatrix/sunmatrix_sparse.h>
 #include <sundials/sundials_context.h>
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +30,7 @@ struct uclchem_cvode_solver {
   SUNContext sunctx;
   N_Vector yvec;
   N_Vector abstol_vec;
+  N_Vector precond_diag;
   SUNMatrix A;
   SUNLinearSolver LS;
   struct uclchem_callback_data callbacks;
@@ -35,10 +38,16 @@ struct uclchem_cvode_solver {
   sunindextype nnz;
   int linear_solver_kind;
   int initialized;
+  int sparse_jac_current;
+  realtype cached_gamma;
 };
 
 static struct uclchem_cvode_solver solver = {0};
-enum { UCLCHEM_LINEAR_SPARSE_KLU = 0, UCLCHEM_LINEAR_DENSE = 1 };
+enum {
+  UCLCHEM_LINEAR_SPARSE_KLU = 0,
+  UCLCHEM_LINEAR_DENSE = 1,
+  UCLCHEM_LINEAR_SPGMR = 2
+};
 
 static void uclchem_append_cvode_log(const char *fmt, ...) {
   FILE *fp;
@@ -105,6 +114,9 @@ static void uclchem_log_solver_diagnostics(const char *stage, int cvode_flag) {
                                common->numerical_rank, common->singular_col, common->noffdiag,
                                common->rcond, common->condest, common->rgrowth);
     }
+  } else if (solver.linear_solver_kind == UCLCHEM_LINEAR_SPGMR && solver.LS != NULL) {
+    sunindextype spgmr_last_flag = SUNLinSolLastFlag_SPGMR(solver.LS);
+    uclchem_append_cvode_log("SPGMR diagnostics: last_flag=%ld", (long)spgmr_last_flag);
   }
 }
 
@@ -156,6 +168,23 @@ static int jac_dense_bridge(realtype t, N_Vector y, N_Vector fy, SUNMatrix J, vo
   return uclchem_cvode_dense_jacobian((double)t, (void *)y_ptr, (void *)jac_data);
 }
 
+static const char *uclchem_linear_solver_name(int linear_solver_kind) {
+  switch (linear_solver_kind) {
+  case UCLCHEM_LINEAR_DENSE:
+    return "dense";
+  case UCLCHEM_LINEAR_SPGMR:
+    return "spgmr";
+  case UCLCHEM_LINEAR_SPARSE_KLU:
+  default:
+    return "sparse_klu";
+  }
+}
+
+static int uclchem_solver_uses_sparse_jacobian(int linear_solver_kind) {
+  return linear_solver_kind == UCLCHEM_LINEAR_SPARSE_KLU ||
+         linear_solver_kind == UCLCHEM_LINEAR_SPGMR;
+}
+
 static int uclchem_linear_solver_kind_from_env(void) {
   const char *value = getenv("UCLCHEM_CVODE_LINEAR_SOLVER");
   if (value == NULL) {
@@ -163,6 +192,11 @@ static int uclchem_linear_solver_kind_from_env(void) {
   }
   if (strcmp(value, "dense") == 0 || strcmp(value, "DENSE") == 0) {
     return UCLCHEM_LINEAR_DENSE;
+  }
+  if (strcmp(value, "spgmr") == 0 || strcmp(value, "SPGMR") == 0 ||
+      strcmp(value, "gmres") == 0 || strcmp(value, "GMRES") == 0 ||
+      strcmp(value, "iterative") == 0 || strcmp(value, "ITERATIVE") == 0) {
+    return UCLCHEM_LINEAR_SPGMR;
   }
   return UCLCHEM_LINEAR_SPARSE_KLU;
 }
@@ -252,6 +286,225 @@ static void uclchem_configure_klu(SUNLinearSolver LS) {
                            ordering, common->scale, common->btf, common->tol);
 }
 
+static void uclchem_configure_spgmr(SUNLinearSolver LS) {
+  int retval;
+  int max_restarts;
+  int gstype;
+
+  if (LS == NULL) {
+    return;
+  }
+
+  max_restarts = uclchem_env_int("UCLCHEM_SPGMR_MAX_RESTARTS", 2);
+  if (max_restarts >= 0) {
+    retval = SUNLinSol_SPGMRSetMaxRestarts(LS, max_restarts);
+    if (retval != SUNLS_SUCCESS) {
+      uclchem_append_cvode_log("SPGMR config: failed to set max_restarts=%d retval=%d",
+                               max_restarts, retval);
+    }
+  }
+
+  gstype = uclchem_env_int("UCLCHEM_SPGMR_GSTYPE", SUNSPGMR_GSTYPE_DEFAULT);
+  retval = SUNLinSol_SPGMRSetGSType(LS, gstype);
+  if (retval != SUNLS_SUCCESS) {
+    uclchem_append_cvode_log("SPGMR config: failed to set gstype=%d retval=%d", gstype, retval);
+  }
+
+  uclchem_append_cvode_log("SPGMR config: maxl=%d max_restarts=%d gstype=%d",
+                           uclchem_env_int("UCLCHEM_SPGMR_MAXL", 30), max_restarts, gstype);
+}
+
+static int uclchem_fill_sparse_jacobian_values(realtype t, N_Vector y) {
+  double *y_ptr;
+  realtype *jac_data;
+
+  if (solver.A == NULL) {
+    return CVLS_MEM_NULL;
+  }
+
+  y_ptr = N_VGetArrayPointer_Serial(y);
+  jac_data = SM_DATA_S(solver.A);
+  if (y_ptr == NULL || jac_data == NULL) {
+    return CVLS_JACFUNC_UNRECVR;
+  }
+
+  return uclchem_cvode_sparse_jacobian((double)t, (void *)y_ptr, (void *)jac_data);
+}
+
+static int uclchem_sparse_matvec(N_Vector v, N_Vector Jv) {
+  realtype *jv_data;
+  realtype *v_data;
+  realtype *jac_data;
+  sunindextype *index_ptrs;
+  sunindextype *index_vals;
+  sunindextype col;
+  sunindextype idx;
+
+  if (solver.A == NULL) {
+    return CVLS_MEM_NULL;
+  }
+
+  jv_data = N_VGetArrayPointer_Serial(Jv);
+  v_data = N_VGetArrayPointer_Serial(v);
+  jac_data = SM_DATA_S(solver.A);
+  index_ptrs = SM_INDEXPTRS_S(solver.A);
+  index_vals = SM_INDEXVALS_S(solver.A);
+  if (jv_data == NULL || v_data == NULL || jac_data == NULL || index_ptrs == NULL ||
+      index_vals == NULL) {
+    return CVLS_MEM_FAIL;
+  }
+
+  for (col = 0; col < solver.neq; ++col) {
+    jv_data[col] = 0.0;
+  }
+
+  for (col = 0; col < solver.neq; ++col) {
+    realtype vcol = v_data[col];
+    if (vcol == 0.0) {
+      continue;
+    }
+
+    for (idx = index_ptrs[col]; idx < index_ptrs[col + 1]; ++idx) {
+      jv_data[index_vals[idx]] += jac_data[idx] * vcol;
+    }
+  }
+
+  return 0;
+}
+
+static int uclchem_build_diag_preconditioner(realtype gamma) {
+  realtype *diag_inv;
+  realtype *jac_data;
+  sunindextype *index_ptrs;
+  sunindextype *index_vals;
+  realtype diag_floor;
+  sunindextype col;
+  sunindextype idx;
+
+  if (solver.A == NULL || solver.precond_diag == NULL) {
+    return CVLS_MEM_NULL;
+  }
+
+  diag_inv = N_VGetArrayPointer_Serial(solver.precond_diag);
+  jac_data = SM_DATA_S(solver.A);
+  index_ptrs = SM_INDEXPTRS_S(solver.A);
+  index_vals = SM_INDEXVALS_S(solver.A);
+  if (diag_inv == NULL || jac_data == NULL || index_ptrs == NULL || index_vals == NULL) {
+    return CVLS_MEM_FAIL;
+  }
+
+  diag_floor = uclchem_env_double("UCLCHEM_DIAG_PRECOND_FLOOR", 1.0e-30);
+
+  for (col = 0; col < solver.neq; ++col) {
+    realtype diag = 1.0;
+    for (idx = index_ptrs[col]; idx < index_ptrs[col + 1]; ++idx) {
+      if (index_vals[idx] == col) {
+        diag -= gamma * jac_data[idx];
+        break;
+      }
+    }
+
+    if (fabs(diag) <= diag_floor) {
+      diag_inv[col] = 1.0;
+    } else {
+      diag_inv[col] = 1.0 / diag;
+    }
+  }
+
+  solver.cached_gamma = gamma;
+  return 0;
+}
+
+static int jtimes_setup_bridge(realtype t, N_Vector y, N_Vector fy, void *user_data) {
+  int retval;
+
+  (void)fy;
+  (void)user_data;
+
+  retval = uclchem_fill_sparse_jacobian_values(t, y);
+  if (retval == 0) {
+    solver.sparse_jac_current = 1;
+  }
+  return retval;
+}
+
+static int jtimes_bridge(N_Vector v, N_Vector Jv, realtype t, N_Vector y, N_Vector fy,
+                         void *user_data, N_Vector tmp) {
+  int retval;
+
+  (void)fy;
+  (void)user_data;
+  (void)tmp;
+
+  if (!solver.sparse_jac_current) {
+    retval = uclchem_fill_sparse_jacobian_values(t, y);
+    if (retval != 0) {
+      return retval;
+    }
+    solver.sparse_jac_current = 1;
+  }
+
+  return uclchem_sparse_matvec(v, Jv);
+}
+
+static int prec_setup_bridge(realtype t, N_Vector y, N_Vector fy, booleantype jok,
+                             booleantype *jcurPtr, realtype gamma, void *user_data) {
+  int retval;
+
+  (void)fy;
+  (void)user_data;
+
+  if (jcurPtr == NULL) {
+    return CVLS_ILL_INPUT;
+  }
+
+  if (!jok || !solver.sparse_jac_current) {
+    retval = uclchem_fill_sparse_jacobian_values(t, y);
+    if (retval != 0) {
+      return retval;
+    }
+    solver.sparse_jac_current = 1;
+    *jcurPtr = SUNTRUE;
+  } else {
+    *jcurPtr = SUNFALSE;
+  }
+
+  return uclchem_build_diag_preconditioner(gamma);
+}
+
+static int prec_solve_bridge(realtype t, N_Vector y, N_Vector fy, N_Vector r, N_Vector z,
+                             realtype gamma, realtype delta, int lr, void *user_data) {
+  realtype *r_data;
+  realtype *z_data;
+  realtype *diag_inv;
+  sunindextype i;
+
+  (void)t;
+  (void)y;
+  (void)fy;
+  (void)gamma;
+  (void)delta;
+  (void)lr;
+  (void)user_data;
+
+  if (solver.precond_diag == NULL) {
+    return CVLS_PMEM_NULL;
+  }
+
+  r_data = N_VGetArrayPointer_Serial(r);
+  z_data = N_VGetArrayPointer_Serial(z);
+  diag_inv = N_VGetArrayPointer_Serial(solver.precond_diag);
+  if (r_data == NULL || z_data == NULL || diag_inv == NULL) {
+    return CVLS_MEM_FAIL;
+  }
+
+  for (i = 0; i < solver.neq; ++i) {
+    z_data[i] = diag_inv[i] * r_data[i];
+  }
+
+  return 0;
+}
+
 static void uclchem_cvode_free_solver(void) {
   if (solver.cvode_mem != NULL) {
     CVodeFree(&solver.cvode_mem);
@@ -261,6 +514,9 @@ static void uclchem_cvode_free_solver(void) {
   }
   if (solver.A != NULL) {
     SUNMatDestroy(solver.A);
+  }
+  if (solver.precond_diag != NULL) {
+    N_VDestroy(solver.precond_diag);
   }
   if (solver.abstol_vec != NULL) {
     N_VDestroy(solver.abstol_vec);
@@ -294,7 +550,9 @@ int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
 
   solver.neq = (sunindextype)neq;
   solver.linear_solver_kind = uclchem_linear_solver_kind_from_env();
-  if (solver.linear_solver_kind == UCLCHEM_LINEAR_SPARSE_KLU) {
+  uclchem_append_cvode_log("CVODE init: linear_solver=%s", uclchem_linear_solver_name(solver.linear_solver_kind));
+
+  if (uclchem_solver_uses_sparse_jacobian(solver.linear_solver_kind)) {
     nnz = uclchem_sparse_jacobian_nnz();
     if (nnz <= 0) {
       uclchem_cvode_free_solver();
@@ -312,7 +570,7 @@ int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
     return CV_MEM_FAIL;
   }
 
-  if (solver.linear_solver_kind == UCLCHEM_LINEAR_SPARSE_KLU) {
+  if (uclchem_solver_uses_sparse_jacobian(solver.linear_solver_kind)) {
     solver.A = SUNSparseMatrix(solver.neq, solver.neq, solver.nnz, CSC_MAT, solver.sunctx);
     if (solver.A == NULL) {
       uclchem_cvode_free_solver();
@@ -327,13 +585,29 @@ int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
     }
     uclchem_sparse_jacobian_pattern((int *)index_ptrs, (int *)index_vals);
 
-    solver.LS = SUNLinSol_KLU(solver.yvec, solver.A, solver.sunctx);
-    if (solver.LS == NULL) {
-      uclchem_cvode_free_solver();
-      return CV_MEM_FAIL;
-    }
+    if (solver.linear_solver_kind == UCLCHEM_LINEAR_SPARSE_KLU) {
+      solver.LS = SUNLinSol_KLU(solver.yvec, solver.A, solver.sunctx);
+      if (solver.LS == NULL) {
+        uclchem_cvode_free_solver();
+        return CV_MEM_FAIL;
+      }
 
-    uclchem_configure_klu(solver.LS);
+      uclchem_configure_klu(solver.LS);
+    } else {
+      int maxl = uclchem_env_int("UCLCHEM_SPGMR_MAXL", 30);
+      if (maxl <= 0) {
+        maxl = 30;
+      }
+
+      solver.LS = SUNLinSol_SPGMR(solver.yvec, SUN_PREC_LEFT, maxl, solver.sunctx);
+      solver.precond_diag = N_VClone(solver.yvec);
+      if (solver.LS == NULL || solver.precond_diag == NULL) {
+        uclchem_cvode_free_solver();
+        return CV_MEM_FAIL;
+      }
+
+      uclchem_configure_spgmr(solver.LS);
+    }
   } else {
     solver.A = SUNDenseMatrix(solver.neq, solver.neq, solver.sunctx);
     if (solver.A == NULL) {
@@ -366,6 +640,8 @@ int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
   solver.callbacks.rhs = rhs;
   solver.callbacks.user_data = NULL;
   solver.initialized = 0;
+  solver.sparse_jac_current = 0;
+  solver.cached_gamma = 0.0;
 
   return CV_SUCCESS;
 }
@@ -378,7 +654,7 @@ int uclchem_cvode_integrate(double *y, double *t, double tout, double reltol, co
   double *abstol_data;
 
   if (solver.cvode_mem == NULL || solver.yvec == NULL || solver.abstol_vec == NULL ||
-      solver.A == NULL || solver.LS == NULL) {
+      solver.LS == NULL || (solver.linear_solver_kind != UCLCHEM_LINEAR_SPGMR && solver.A == NULL)) {
     return CV_NO_MALLOC;
   }
   if (y == NULL || t == NULL || abstol == NULL) {
@@ -395,6 +671,7 @@ int uclchem_cvode_integrate(double *y, double *t, double tout, double reltol, co
     y_data[i] = y[i];
     abstol_data[i] = abstol[i];
   }
+  solver.sparse_jac_current = 0;
 
   if (!solver.initialized) {
     retval = CVodeInit(solver.cvode_mem, rhs_bridge, (realtype)(*t), solver.yvec);
@@ -407,21 +684,36 @@ int uclchem_cvode_integrate(double *y, double *t, double tout, double reltol, co
       return retval;
     }
 
-    retval = CVodeSetLinearSolver(solver.cvode_mem, solver.LS, solver.A);
+    retval = CVodeSetLinearSolver(
+        solver.cvode_mem, solver.LS,
+        (solver.linear_solver_kind == UCLCHEM_LINEAR_SPGMR) ? NULL : solver.A);
     if (retval != CV_SUCCESS) {
       return retval;
     }
 
-    retval = CVodeSetJacFn(
-        solver.cvode_mem,
-        (solver.linear_solver_kind == UCLCHEM_LINEAR_SPARSE_KLU) ? jac_sparse_bridge : jac_dense_bridge);
-    if (retval != CV_SUCCESS) {
-      return retval;
+    if (solver.linear_solver_kind == UCLCHEM_LINEAR_SPGMR) {
+      retval = CVodeSetJacTimes(solver.cvode_mem, jtimes_setup_bridge, jtimes_bridge);
+      if (retval != CV_SUCCESS) {
+        return retval;
+      }
+
+      retval = CVodeSetPreconditioner(solver.cvode_mem, prec_setup_bridge, prec_solve_bridge);
+      if (retval != CV_SUCCESS) {
+        return retval;
+      }
+    } else {
+      retval = CVodeSetJacFn(
+          solver.cvode_mem,
+          (solver.linear_solver_kind == UCLCHEM_LINEAR_SPARSE_KLU) ? jac_sparse_bridge : jac_dense_bridge);
+      if (retval != CV_SUCCESS) {
+        return retval;
+      }
     }
 
     {
       int msbj = uclchem_env_int("UCLCHEM_CVODE_JAC_EVAL_FREQUENCY", -1);
       int linscale = uclchem_env_bool("UCLCHEM_CVODE_LINEAR_SOLUTION_SCALING", -1);
+      double epslin = uclchem_env_double("UCLCHEM_CVODE_EPS_LIN", -1.0);
 
       if (msbj > 0) {
         retval = CVodeSetJacEvalFrequency(solver.cvode_mem, (long int)msbj);
@@ -437,6 +729,14 @@ int uclchem_cvode_integrate(double *y, double *t, double tout, double reltol, co
           return retval;
         }
         uclchem_append_cvode_log("CVODE config: linear_solution_scaling=%d", linscale);
+      }
+
+      if (epslin > 0.0) {
+        retval = CVodeSetEpsLin(solver.cvode_mem, (realtype)epslin);
+        if (retval != CV_SUCCESS) {
+          return retval;
+        }
+        uclchem_append_cvode_log("CVODE config: eps_lin=%.17g", epslin);
       }
     }
 

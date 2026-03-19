@@ -172,6 +172,14 @@ CONTAINS
         & (TRIM(ADJUSTL(linear_solver_env(:env_length))) == "dense" .OR. &
         & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "DENSE")) THEN
             CALL log_cvode_event("Initializing CVODE solver with dense linear solver")
+        ELSE IF (env_status == 0 .AND. env_length > 0 .AND. &
+        & (TRIM(ADJUSTL(linear_solver_env(:env_length))) == "spgmr" .OR. &
+        & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "SPGMR" .OR. &
+        & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "gmres" .OR. &
+        & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "GMRES" .OR. &
+        & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "iterative" .OR. &
+        & TRIM(ADJUSTL(linear_solver_env(:env_length))) == "ITERATIVE")) THEN
+            CALL log_cvode_event("Initializing CVODE solver with SPGMR diagonal preconditioner")
         ELSE
             CALL log_cvode_event("Initializing CVODE solver with sparse KLU linear solver")
         END IF
