@@ -43,6 +43,7 @@ struct uclchem_cvode_solver {
   int spgmr_preconditioner_kind;
   int initialized;
   int sparse_jac_current;
+  int precond_current;
   realtype cached_gamma;
 };
 
@@ -297,6 +298,22 @@ static int uclchem_env_bool(const char *name, int default_value) {
   return default_value;
 }
 
+static int uclchem_gamma_reusable(realtype gamma) {
+  realtype scale;
+  realtype tol;
+
+  scale = fabs(gamma);
+  if (fabs(solver.cached_gamma) > scale) {
+    scale = fabs(solver.cached_gamma);
+  }
+  if (scale < 1.0) {
+    scale = 1.0;
+  }
+
+  tol = uclchem_env_double("UCLCHEM_PRECOND_GAMMA_REUSE_RTOL", 1.0e-12) * scale;
+  return fabs(gamma - solver.cached_gamma) <= tol;
+}
+
 static void uclchem_configure_klu(SUNLinearSolver LS) {
   int retval;
   int ordering;
@@ -510,6 +527,7 @@ static int jtimes_setup_bridge(realtype t, N_Vector y, N_Vector fy, void *user_d
   retval = uclchem_fill_sparse_jacobian_values(t, y);
   if (retval == 0) {
     solver.sparse_jac_current = 1;
+    solver.precond_current = 0;
   }
   return retval;
 }
@@ -528,6 +546,7 @@ static int jtimes_bridge(N_Vector v, N_Vector Jv, realtype t, N_Vector y, N_Vect
       return retval;
     }
     solver.sparse_jac_current = 1;
+    solver.precond_current = 0;
   }
 
   return uclchem_sparse_matvec(v, Jv);
@@ -536,6 +555,8 @@ static int jtimes_bridge(N_Vector v, N_Vector Jv, realtype t, N_Vector y, N_Vect
 static int prec_setup_bridge(realtype t, N_Vector y, N_Vector fy, booleantype jok,
                              booleantype *jcurPtr, realtype gamma, void *user_data) {
   int retval;
+  int jacobian_reused;
+  int gamma_reused;
 
   (void)fy;
   (void)user_data;
@@ -550,9 +571,16 @@ static int prec_setup_bridge(realtype t, N_Vector y, N_Vector fy, booleantype jo
       return retval;
     }
     solver.sparse_jac_current = 1;
+    solver.precond_current = 0;
     *jcurPtr = SUNTRUE;
   } else {
     *jcurPtr = SUNFALSE;
+  }
+
+  jacobian_reused = (*jcurPtr == SUNFALSE);
+  gamma_reused = solver.precond_current && uclchem_gamma_reusable(gamma);
+  if (jacobian_reused && gamma_reused) {
+    return 0;
   }
 
   if (solver.spgmr_preconditioner_kind == UCLCHEM_SPGMR_PRECOND_KLU) {
@@ -567,10 +595,15 @@ static int prec_setup_bridge(realtype t, N_Vector y, N_Vector fy, booleantype jo
       return 1;
     }
 
+    solver.precond_current = 1;
     return 0;
   }
 
-  return uclchem_build_diag_preconditioner(gamma);
+  retval = uclchem_build_diag_preconditioner(gamma);
+  if (retval == 0) {
+    solver.precond_current = 1;
+  }
+  return retval;
 }
 
 static int prec_solve_bridge(realtype t, N_Vector y, N_Vector fy, N_Vector r, N_Vector z,
@@ -812,6 +845,7 @@ int uclchem_cvode_init(int neq, uclchem_rhs_fn rhs) {
   solver.callbacks.user_data = NULL;
   solver.initialized = 0;
   solver.sparse_jac_current = 0;
+  solver.precond_current = 0;
   solver.cached_gamma = 0.0;
 
   return CV_SUCCESS;
@@ -856,6 +890,8 @@ int uclchem_cvode_integrate(double *y, double *t, double tout, double reltol, co
     abstol_data[i] = abstol[i];
   }
   solver.sparse_jac_current = 0;
+  solver.precond_current = 0;
+  solver.cached_gamma = 0.0;
 
   if (!solver.initialized) {
     retval = CVodeInit(solver.cvode_mem, rhs_bridge, (realtype)(*t), solver.yvec);
